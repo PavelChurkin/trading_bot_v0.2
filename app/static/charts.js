@@ -222,6 +222,12 @@
     for (let i = s0.length - 1; i >= 0; i--) if (s0[i] !== null && s0[i] !== undefined) {
       const t = el("text", { x: f.W - PAD.r + 6, y: f.y(s0[i]) + 4, fill: C.ink, "font-size": 11, "font-weight": 600 }, f.svg);
       t.textContent = fmt(s0[i]);
+      // деления оси Y, на которые наезжает подпись, прячем
+      f.svg.querySelectorAll("text.tick").forEach((tk) => {
+        if (+tk.getAttribute("x") === f.W - PAD.r + 6 && Math.abs(+tk.getAttribute("y") - (f.y(s0[i]) + 4)) < 12) {
+          tk.setAttribute("visibility", "hidden");
+        }
+      });
       break;
     }
     const items = series.map((s) => ({ name: s.name, color: s.color, dash: s.dash }));

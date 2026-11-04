@@ -692,7 +692,7 @@
           <h3>Сейчас</h3><p class="mono small">${esc(m.current || "простой")}</p>
           ${m.p1_cycle ? `<h3>Последний цикл P1</h3>${kv([["Цикл", "#" + m.p1_cycle.cycle_id], ["Начат", esc(m.p1_cycle.started_at)],
             ["Длительность", num(m.p1_cycle.duration_sec, 0) + " с"], ["Бумаг", m.p1_cycle.tickers]])}` : ""}</div>
-          <div><h3>Порядок последних задач</h3><ul class="plain small mono">${m.recent_jobs.map((j) =>
+          <div><h3>Порядок последних задач</h3><ul class="plain small mono" style="max-height:300px;overflow:auto">${m.recent_jobs.map((j) =>
             `<li><span class="tag ${j.priority === "P0" ? "accent" : ""}">${j.priority}</span> ${esc(j.name)}</li>`).join("")}</ul>
           ${m.recent_errors.length ? `<h3>Ошибки</h3><ul class="plain small">${m.recent_errors.map((e) => `<li class="error">${esc(e.error)}</li>`).join("")}</ul>` : ""}</div></div>`;
     };
@@ -704,7 +704,7 @@
       const box = $("#m-all");
       box.innerHTML = '<div id="m-bars"></div><h3>Динамика топ-5</h3><div id="m-lines"></div>';
       TB.bars($("#m-bars"), rows.map((x) => ({ label: x.ticker, value: isPct ? x.last * 100 : x.last,
-        text: isPct ? num(x.last * 100, 0) + "%" : num(x.last, 2), title: "обновлено " + x.ts, onclick: () => go("ticker/" + x.ticker) })),
+        text: isPct ? closePct(x.last) + "%" : num(x.last, 2), title: "обновлено " + x.ts, onclick: () => go("ticker/" + x.ticker) })),
         isPct ? { max: 100 } : {});
       // топ-5 на одном графике по общей оси времени
       const top = rows.slice(0, 5);
