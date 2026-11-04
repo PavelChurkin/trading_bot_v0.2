@@ -1,0 +1,570 @@
+"""FastAPI: REST API дашборда + раздача SPA/PWA.
+
+Авторизация — только ключом (п. «Авторизация»): ``POST /api/login`` с ключом
+создаёт сессию (httpOnly cookie ``tb_session``; для скриптов можно передать
+``Authorization: Bearer <session>``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import alerts as al
+from . import analysis as an
+from . import auth
+from . import charts
+from . import settings_schema as ss
+from .db import Database
+from .push import PushService
+from .scanner import BLUE_CHIPS, Scanner
+from .scheduler import RequestScheduler
+from .timeutil import fmt_ts, now_msk
+
+logger = logging.getLogger(__name__)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+COOKIE = "tb_session"
+
+
+@dataclass
+class AppContext:
+    db: Database
+    scheduler: RequestScheduler
+    push: PushService
+    scanner: Scanner
+    stop_callback: Any = None  # кнопка «Остановить» в админке (то же, что «0» в консоли)
+    background: set = field(default_factory=set)
+
+
+def create_app(ctx: AppContext) -> FastAPI:
+    app = FastAPI(title="Trading bot dashboard", version="0.2.0", docs_url="/api/docs", redoc_url=None)
+    db, scanner, push = ctx.db, ctx.scanner, ctx.push
+
+    # ================================================================ auth
+    def session_token(request: Request) -> Optional[str]:
+        h = request.headers.get("authorization", "")
+        if h.lower().startswith("bearer "):
+            return h[7:].strip()
+        return request.cookies.get(COOKIE)
+
+    def current_user(request: Request) -> dict[str, Any]:
+        user = auth.user_by_session(db, session_token(request))
+        if not user:
+            raise HTTPException(401, "Нужен вход по ключу")
+        return user
+
+    def admin_user(user: dict = Depends(current_user)) -> dict[str, Any]:
+        if user["role"] != "admin":
+            raise HTTPException(403, "Только для администратора")
+        return user
+
+    def spawn(coro) -> None:
+        task = asyncio.get_event_loop().create_task(coro)
+        ctx.background.add(task)
+        task.add_done_callback(ctx.background.discard)
+
+    @app.post("/api/login")
+    async def api_login(body: dict, response: Response):
+        res = auth.login(db, str(body.get("key") or ""))
+        if not res:
+            raise HTTPException(401, "Ключ не найден или деактивирован")
+        token, user = res
+        response.set_cookie(COOKIE, token, httponly=True, samesite="lax", max_age=auth.SESSION_DAYS * 86400,
+                            secure=bool(body.get("secure")))
+        return {"user": user}
+
+    @app.post("/api/logout")
+    async def api_logout(request: Request, response: Response):
+        auth.logout(db, session_token(request))
+        response.delete_cookie(COOKIE)
+        return {"ok": True}
+
+    @app.get("/api/me")
+    async def api_me(user: dict = Depends(current_user)):
+        return {"user": user, "is_admin": user["role"] == "admin", "vapid_public_key": push.public_key,
+                "push_available": push.available, "push_error": push.error,
+                "devices": len(push.subscriptions(user["id"]))}
+
+    # ============================================================== статус
+    @app.get("/api/status")
+    async def api_status(user: dict = Depends(current_user)):
+        return {"now": fmt_ts(now_msk()), "cycle": scanner.cycle_info, "cycle_running": scanner.cycle_running,
+                "index": scanner.index, "tickers": sum(1 for s in scanner.securities.values() if s.get("active")),
+                "scheduler": {"queue": ctx.scheduler.queue_lengths(), "current": ctx.scheduler.current},
+                "orderbook_available": scanner.iss.orderbook_available, "started_at": fmt_ts(scanner.started_at)}
+
+    @app.get("/api/scheduler")
+    async def api_scheduler(user: dict = Depends(current_user)):
+        m = ctx.scheduler.metrics()
+        m["cache"] = {"items": len(scanner.iss.cache), "hits": scanner.iss.cache.hits,
+                      "misses": scanner.iss.cache.misses}
+        m["orderbook_available"] = scanner.iss.orderbook_available
+        m["recent_jobs"] = [{"priority": f"P{p}", "name": n} for p, n in list(ctx.scheduler.order_log)[-30:]][::-1]
+        return m
+
+    # ============================================================ настройки
+    @app.get("/api/settings")
+    async def api_settings(user: dict = Depends(current_user)):
+        is_admin = user["role"] == "admin"
+        return {"schema": ss.schema_for_ui(is_admin), "values": db.effective_settings(user["id"]),
+                "overrides": db.user_overrides(user["id"]), "global": db.global_settings() if is_admin else None}
+
+    def _coerce_all(values: dict[str, Any], allow_admin: bool) -> dict[str, Any]:
+        out, errors = {}, {}
+        for k, v in (values or {}).items():
+            spec = ss.SETTINGS_BY_KEY.get(k)
+            if spec is None:
+                errors[k] = "неизвестная настройка"
+                continue
+            if spec.scope == "admin" and not allow_admin:
+                errors[k] = "только администратор"
+                continue
+            try:
+                out[k] = ss.coerce(k, v)
+            except (ValueError, TypeError) as exc:
+                errors[k] = str(exc)
+        if errors:
+            raise HTTPException(422, {"errors": errors})
+        return out
+
+    @app.put("/api/settings")
+    async def api_save_settings(body: dict, user: dict = Depends(current_user)):
+        values = _coerce_all(body.get("values") or {}, allow_admin=False)
+        db.save_settings(f"user:{user['id']}", values)
+        return {"values": db.effective_settings(user["id"]), "overrides": db.user_overrides(user["id"])}
+
+    @app.delete("/api/settings")
+    async def api_reset_settings(key: Optional[str] = None, user: dict = Depends(current_user)):
+        db.reset_user_settings(user["id"], [key] if key else None)
+        return {"values": db.effective_settings(user["id"]), "overrides": db.user_overrides(user["id"])}
+
+    @app.put("/api/admin/settings")
+    async def api_admin_settings(body: dict, user: dict = Depends(admin_user)):
+        values = _coerce_all(body.get("values") or {}, allow_admin=True)
+        db.save_settings("global", values)
+        if body.get("scan_now"):
+            scanner.request_cycle()
+        return {"global": db.global_settings()}
+
+    # ================================================================ ключи
+    @app.get("/api/admin/keys")
+    async def api_keys(user: dict = Depends(admin_user)):
+        return {"keys": auth.list_keys(db)}
+
+    @app.post("/api/admin/keys")
+    async def api_create_key(body: dict, user: dict = Depends(admin_user)):
+        return auth.create_user_key(db, str(body.get("label") or ""))
+
+    @app.patch("/api/admin/keys/{key_id}")
+    async def api_patch_key(key_id: int, body: dict, user: dict = Depends(admin_user)):
+        if not auth.set_key_active(db, key_id, bool(body.get("active"))):
+            raise HTTPException(400, "Ключ не найден или это ключ администратора")
+        return {"keys": auth.list_keys(db)}
+
+    @app.delete("/api/admin/keys/{key_id}")
+    async def api_delete_key(key_id: int, user: dict = Depends(admin_user)):
+        if not auth.delete_key(db, key_id):
+            raise HTTPException(400, "Ключ не найден или это ключ администратора")
+        return {"keys": auth.list_keys(db)}
+
+    @app.post("/api/admin/scan-now")
+    async def api_scan_now(user: dict = Depends(admin_user)):
+        scanner.request_cycle()
+        return {"ok": True, "cycle_running": scanner.cycle_running}
+
+    @app.post("/api/admin/stop")
+    async def api_stop(user: dict = Depends(admin_user)):
+        if ctx.stop_callback is None:
+            raise HTTPException(400, "Остановка недоступна")
+        asyncio.get_event_loop().call_later(0.5, ctx.stop_callback)
+        return {"ok": True}
+
+    # ================================================================= пуши
+    @app.get("/api/push/key")
+    async def api_push_key():
+        return {"public_key": push.public_key, "available": push.available, "error": push.error}
+
+    @app.post("/api/push/subscribe")
+    async def api_subscribe(body: dict, request: Request, user: dict = Depends(current_user)):
+        try:
+            sid = push.subscribe(user["id"], body.get("subscription") or body, request.headers.get("user-agent", ""))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return {"id": sid, "devices": len(push.subscriptions(user["id"]))}
+
+    @app.post("/api/push/unsubscribe")
+    async def api_unsubscribe(body: dict, user: dict = Depends(current_user)):
+        n = push.unsubscribe(user["id"], body.get("endpoint"))
+        return {"removed": n, "devices": len(push.subscriptions(user["id"]))}
+
+    async def _delayed_push(key_ids: list[int], delay: float, title: str, text: str) -> None:
+        await asyncio.sleep(delay)
+        for kid in key_ids:
+            res = await push.send_to_key(kid, title, text, {"url": "/#settings", "test": True})
+            db.set_state(f"test_push:{kid}", {**res, "ts": fmt_ts(now_msk())})
+
+    @app.post("/api/push/test")
+    async def api_test_push(body: dict, user: dict = Depends(current_user)):
+        """Тестовый пуш себе. Админ может указать ``key_id`` или ``all``.
+        Таймер ``delay_sec`` (по умолчанию из настроек, 1 с) — чтобы успеть
+        свернуть браузер/заблокировать телефон."""
+        is_admin = user["role"] == "admin"
+        delay = body.get("delay_sec")
+        delay = float(db.global_settings()["test_push_delay_sec"] if delay in (None, "") else delay)
+        delay = min(max(delay, 0.0), 3600.0)
+        targets = [user["id"]]
+        if is_admin and body.get("all"):
+            targets = auth.active_user_ids(db)
+        elif is_admin and body.get("key_id"):
+            targets = [int(body["key_id"])]
+        devices = sum(len(push.subscriptions(k)) for k in targets)
+        title = str(body.get("title") or "Тестовое уведомление")[:200]
+        text = str(body.get("body") or f"Пуш работает · {fmt_ts(now_msk())} МСК")[:600]
+        spawn(_delayed_push(targets, delay, title, text))
+        return {"scheduled_in_sec": delay, "targets": targets, "devices": devices,
+                "push_available": push.available, "error": push.error}
+
+    @app.post("/api/push/preview")
+    async def api_push_preview(body: dict, user: dict = Depends(current_user)):
+        """Предпросмотр формата пуша на примере последнего алерта."""
+        s = db.effective_settings(user["id"])
+        for k in ("push_title_template", "push_body_template"):
+            if body.get(k) is not None:
+                s[k] = str(body[k])
+        row = db.query_one("SELECT * FROM alerts WHERE ticker != 'РЫНОК' ORDER BY id DESC LIMIT 1")
+        sample = al.alert_from_row(row) if row else al.Alert(
+            ticker="SBER", ts=fmt_ts(now_msk()), direction="up_pulse", score=72, amplitude_atr=2.1,
+            volume_ratio=2.4, level_break=1, reason="SBER: амплитуда 2.10×ATR, объём 2.40× среднего, пробой max 20 свечей",
+            impulse_age_min=15, action="enter", price=312.5).to_dict()
+        return al.format_push(sample, s)
+
+    # ============================================================== таблица
+    def _row(ticker: str, snap: Optional[dict[str, Any]], s: dict[str, Any]) -> dict[str, Any]:
+        sec = scanner.securities.get(ticker) or {}
+        row = {"ticker": ticker, "name": sec.get("name"), "price": sec.get("last"),
+               "day_change_pct": sec.get("day_change_pct"), "volume_today": sec.get("volume_today"),
+               "value_today": sec.get("value_today"), "daily_atr_pct": sec.get("daily_atr_pct")}
+        if snap:
+            ev = al.evaluate(snap, s)
+            row.update({k: snap.get(k) for k in ("amplitude_pct", "amplitude_atr", "atr", "volume", "volume_ratio",
+                                                  "change_hour_pct", "level_break", "impulse_age_min",
+                                                  "pullback_pct", "plate_score", "direction", "level_distance_atr")})
+            row["price"] = snap.get("price") or row["price"]
+            row["updated"] = snap.get("ts")
+            row["threshold_closeness"] = ev.closeness
+            row["triggered"] = ev.triggered
+            row["late"] = (snap.get("impulse_age_min") or 0) > s["impulse_age_max_min"]
+        return row
+
+    @app.get("/api/table")
+    async def api_table(user: dict = Depends(current_user)):
+        s = db.effective_settings(user["id"])
+        snaps = db.snapshots(int(s["candle_window_min"]))
+        favs = {r["ticker"] for r in db.query("SELECT ticker FROM favorites WHERE key_id = ?", (user["id"],))}
+        rows = []
+        for t, sec in scanner.securities.items():
+            if not sec.get("active"):
+                continue
+            r = _row(t, snaps.get(t), s)
+            r["favorite"] = t in favs
+            rows.append(r)
+        rows.sort(key=lambda r: (-(r.get("threshold_closeness") or 0), r["ticker"]))
+        return {"columns": s["dashboard_columns"], "labels": ss.DASHBOARD_COLUMNS, "rows": rows,
+                "window": s["candle_window_min"], "cycle": scanner.cycle_info}
+
+    @app.get("/api/ticker/{ticker}")
+    async def api_ticker(ticker: str, days: int = 7, user: dict = Depends(current_user)):
+        ticker = ticker.upper()
+        if ticker not in scanner.securities:
+            raise HTTPException(404, "Тикер не найден")
+        s = db.effective_settings(user["id"])
+        w = int(s["candle_window_min"])
+        snap = db.snapshot(ticker, w)
+        series = charts.ticker_series(db, ticker, w, max(1, min(days, 14)))
+        alerts_rows = db.query("SELECT * FROM alerts WHERE (key_id IS NULL OR key_id = ?) AND ticker = ? "
+                               "ORDER BY ts DESC, id DESC LIMIT 30", (user["id"], ticker))
+        last_detail = db.get_state(f"analysis:{ticker}")
+        return {"ticker": ticker, "security": scanner.securities[ticker], "row": _row(ticker, snap, s),
+                "snapshot": snap, "evaluation": _ev(al.evaluate(snap, s)) if snap else None,
+                "series": series, "charts": s["charts"], "chart_labels": ss.CHARTS,
+                "alerts": [al.alert_from_row(r) for r in alerts_rows], "analysis": last_detail,
+                "favorite": bool(db.query_one("SELECT 1 FROM favorites WHERE key_id = ? AND ticker = ?",
+                                              (user["id"], ticker)))}
+
+    @app.get("/api/metrics/{metric}")
+    async def api_metric(metric: str, hours: float = 24, user: dict = Depends(current_user)):
+        return charts.metric_all_tickers(db, metric, max(0.5, min(hours, 24 * 14)))
+
+    # ======================================================== P0 — кнопки
+    def _remember(res: dict[str, Any]) -> dict[str, Any]:
+        if res.get("ticker") and not res.get("error"):
+            db.set_state(f"analysis:{res['ticker']}", res)
+        return res
+
+    @app.post("/api/analyze")
+    async def api_analyze(body: dict, user: dict = Depends(current_user)):
+        try:
+            return _remember(await scanner.analyze(str(body.get("ticker") or ""), user["id"]))
+        except KeyError as exc:
+            raise HTTPException(404, str(exc.args[0])) from exc
+
+    @app.post("/api/analyze-many")
+    async def api_analyze_many(body: dict, user: dict = Depends(current_user)):
+        tickers = body.get("tickers") or []
+        if isinstance(tickers, str):
+            tickers = tickers.replace(";", ",").replace(" ", ",").split(",")
+        if body.get("favorites"):
+            tickers = [r["ticker"] for r in db.query("SELECT ticker FROM favorites WHERE key_id = ?", (user["id"],))]
+        tickers = [t.strip().upper() for t in tickers if t.strip()][:30]
+        unknown = [t for t in tickers if t not in scanner.securities]
+        tickers = [t for t in tickers if t in scanner.securities]
+        res = [_remember(r) for r in await scanner.analyze_many(tickers, user["id"])]
+        return {"results": res, "unknown": unknown}
+
+    @app.post("/api/top10")
+    async def api_top10(user: dict = Depends(current_user)):
+        """Топ-10 голубых фишек (бывший пункт меню 5): группы BUY/SELL/HOLD по силе."""
+        res = [_remember(r) for r in await scanner.analyze_many(BLUE_CHIPS, user["id"])]
+        groups: dict[str, list[dict[str, Any]]] = {k: [] for k in an.VERDICT_LABELS}
+        for r in res:
+            if r.get("verdict"):
+                groups[r["verdict"]["verdict"]].append(r)
+        for g in groups.values():
+            g.sort(key=lambda r: -r["verdict"]["strength"])
+        return {"groups": groups, "labels": an.VERDICT_LABELS, "errors": [r for r in res if r.get("error")]}
+
+    @app.post("/api/pulsating")
+    async def api_pulsating(body: dict | None = None, user: dict = Depends(current_user)):
+        """Пульсирующие акции (бывший пункт меню 6): амплитуда окна 1–5%,
+        топ по амплитуде, детальный P0-анализ топ-3, индекс IMOEX."""
+        body = body or {}
+        s = db.effective_settings(user["id"])
+        lo, hi = float(body.get("min_pct", 1.0)), float(body.get("max_pct", 5.0))
+        snaps = db.snapshots(int(s["candle_window_min"]))
+        rows = [_row(t, snap, s) for t, snap in snaps.items()
+                if lo <= (snap.get("amplitude_pct") or 0) <= hi and scanner.securities.get(t, {}).get("active")]
+        rows.sort(key=lambda r: -(r.get("amplitude_pct") or 0))
+        rows = rows[: int(body.get("limit", 20))]
+        detail = [_remember(r) for r in await scanner.analyze_many([r["ticker"] for r in rows[:3]], user["id"])]
+        return {"rows": rows, "detail": detail, "index": scanner.index, "range": [lo, hi]}
+
+    @app.get("/api/search")
+    async def api_search(q: str = "", user: dict = Depends(current_user)):
+        q = q.strip().upper()
+        if not q:
+            return {"results": []}
+        out = []
+        for t, sec in scanner.securities.items():
+            name = (sec.get("name") or "").upper() + " " + (sec.get("full_name") or "").upper()
+            if q in t or q in name:
+                out.append({"ticker": t, "name": sec.get("name"), "full_name": sec.get("full_name"),
+                            "price": sec.get("last"), "day_change_pct": sec.get("day_change_pct"),
+                            "active": sec.get("active")})
+        out.sort(key=lambda r: (not r["ticker"].startswith(q), r["ticker"]))
+        return {"results": out[:30]}
+
+    # ============================================================ избранное
+    @app.get("/api/favorites")
+    async def api_favorites(user: dict = Depends(current_user)):
+        rows = db.query("SELECT ticker FROM favorites WHERE key_id = ? ORDER BY ticker", (user["id"],))
+        return {"tickers": [r["ticker"] for r in rows]}
+
+    @app.post("/api/favorites")
+    async def api_add_favorite(body: dict, user: dict = Depends(current_user)):
+        t = str(body.get("ticker") or "").upper()
+        if t not in scanner.securities:
+            raise HTTPException(404, "Тикер не найден")
+        db.execute("INSERT OR IGNORE INTO favorites (key_id, ticker) VALUES (?, ?)", (user["id"], t))
+        return await api_favorites(user)
+
+    @app.delete("/api/favorites/{ticker}")
+    async def api_del_favorite(ticker: str, user: dict = Depends(current_user)):
+        db.execute("DELETE FROM favorites WHERE key_id = ? AND ticker = ?", (user["id"], ticker.upper()))
+        return await api_favorites(user)
+
+    # =============================================================== алерты
+    @app.get("/api/alerts")
+    async def api_alerts(scope: str = "mine", ticker: Optional[str] = None, direction: Optional[str] = None,
+                         day: Optional[str] = None, limit: int = 200, user: dict = Depends(current_user)):
+        """История сигналов (п. 9). ``scope=mine`` — алерты по моим порогам
+        (с отметкой отправлен/подавлен), ``scope=all`` — общий журнал сканера."""
+        where, params = [], []
+        if scope == "all":
+            where.append("key_id IS NULL")
+        else:
+            where.append("key_id = ?")
+            params.append(user["id"])
+        if ticker:
+            where.append("ticker = ?")
+            params.append(ticker.upper())
+        if direction:
+            where.append("direction = ?")
+            params.append(direction)
+        if day:
+            where.append("substr(ts,1,10) = ?")
+            params.append(day)
+        rows = db.query(f"SELECT * FROM alerts WHERE {' AND '.join(where)} ORDER BY ts DESC, id DESC LIMIT ?",
+                        (*params, max(1, min(limit, 1000))))
+        return {"alerts": [al.alert_from_row(r) for r in rows], "directions": ss.ALERT_DIRECTIONS}
+
+    # ======================================================= журнал решений
+    @app.get("/api/decisions")
+    async def api_decisions(cycle_id: Optional[int] = None, ticker: Optional[str] = None, limit: int = 300,
+                            user: dict = Depends(current_user)):
+        """Журнал решений (п. 24): строка на тикер × цикл, глобальные пороги."""
+        if ticker:
+            rows = db.query("SELECT * FROM decisions WHERE ticker = ? ORDER BY id DESC LIMIT ?",
+                            (ticker.upper(), max(1, min(limit, 2000))))
+        else:
+            if cycle_id is None:
+                r = db.query_one("SELECT MAX(cycle_id) AS c FROM decisions")
+                cycle_id = r["c"] if r else None
+            rows = db.query("SELECT * FROM decisions WHERE cycle_id = ? ORDER BY closeness DESC, ticker",
+                            (cycle_id,))
+        for r in rows:
+            r["details"] = json.loads(r.get("details") or "{}")
+        cycles = db.query("SELECT cycle_id, MIN(ts) AS ts, COUNT(*) AS n, SUM(passed) AS passed FROM decisions "
+                          "GROUP BY cycle_id ORDER BY cycle_id DESC LIMIT 30")
+        return {"cycle_id": cycle_id, "decisions": rows, "cycles": cycles}
+
+    @app.get("/api/silent")
+    async def api_silent(limit: int = 50, user: dict = Depends(current_user)):
+        """«Почему молчит» (п. 24): по последним снапшотам и МОИМ порогам —
+        кто ближе всего к срабатыванию и какого условия не хватило."""
+        s = db.effective_settings(user["id"])
+        snaps = db.snapshots(int(s["candle_window_min"]))
+        out = []
+        for t, snap in snaps.items():
+            if not scanner.securities.get(t, {}).get("active"):
+                continue
+            ev = al.evaluate(snap, s)
+            out.append({"ticker": t, "name": scanner.securities[t].get("name"), "ts": snap.get("ts"),
+                        "triggered": ev.triggered, "closeness": ev.closeness, "failed": ev.failed,
+                        "checks": ev.checks, "price": snap.get("price"),
+                        "amplitude_atr": snap.get("amplitude_atr"), "volume_ratio": snap.get("volume_ratio")})
+        out.sort(key=lambda r: (r["triggered"], -r["closeness"]))
+        silent = [r for r in out if not r["triggered"]][:limit]
+        return {"silent": silent, "triggered": [r for r in out if r["triggered"]],
+                "thresholds": {k: s[k] for k in ("amplitude_atr_min", "amplitude_atr_max", "volume_mult",
+                                                  "level_break_enabled", "candle_window_min")}}
+
+    # ========================================================== отчёт дня
+    @app.get("/api/report")
+    async def api_report(day: Optional[str] = None, user: dict = Depends(current_user)):
+        day = day or now_msk().strftime("%Y-%m-%d")
+        stored = db.query_one("SELECT * FROM daily_reports WHERE (key_id = ? OR key_id IS NULL) AND day = ? "
+                              "ORDER BY id DESC LIMIT 1", (user["id"], day))
+        live = scanner.daily_top(day, user["id"])
+        reports = db.query("SELECT day, MAX(created_at) AS created_at FROM daily_reports WHERE key_id = ? OR "
+                           "key_id IS NULL GROUP BY day ORDER BY day DESC LIMIT 30", (user["id"],))
+        return {"day": day, "live": live, "stored": json.loads(stored["data"]) if stored else None,
+                "days": reports, "report_time": db.effective_settings(user["id"])["daily_report_time"]}
+
+    @app.post("/api/report/send")
+    async def api_report_send(user: dict = Depends(current_user)):
+        s = db.effective_settings(user["id"])
+        day = now_msk().strftime("%Y-%m-%d")
+        rep = await scanner.make_daily_report(user["id"], {**s, "daily_report_enabled": True}, day, send=True)
+        return rep
+
+    # ======================================================= paper trading
+    @app.get("/api/paper")
+    async def api_paper(user: dict = Depends(current_user)):
+        rows = db.query("SELECT * FROM paper_trades WHERE key_id = ? ORDER BY id DESC LIMIT 300", (user["id"],))
+        for r in rows:
+            sec = scanner.securities.get(r["ticker"]) or {}
+            if r["status"] == "open" and sec.get("last"):
+                sign = 1 if r["side"] == "long" else -1
+                r["current_price"] = sec["last"]
+                r["unrealized_pct"] = round((sec["last"] - r["entry_price"]) / r["entry_price"] * 100 * sign, 3)
+        closed = [r for r in rows if r["status"] != "open" and r.get("result_pct") is not None]
+        stats = {"open": sum(1 for r in rows if r["status"] == "open"), "closed": len(closed),
+                 "wins": sum(1 for r in closed if r["result_pct"] > 0),
+                 "total_pct": round(sum(r["result_pct"] for r in closed), 3)}
+        stats["winrate"] = round(stats["wins"] / len(closed) * 100, 1) if closed else None
+        return {"trades": rows, "stats": stats}
+
+    @app.post("/api/paper")
+    async def api_paper_open(body: dict, user: dict = Depends(current_user)):
+        alert = None
+        if body.get("alert_id"):
+            row = db.query_one("SELECT * FROM alerts WHERE id = ?", (int(body["alert_id"]),))
+            alert = al.alert_from_row(row) if row else None
+        ticker = str(body.get("ticker") or (alert or {}).get("ticker") or "").upper()
+        if ticker not in scanner.securities:
+            raise HTTPException(404, "Тикер не найден")
+        sec = scanner.securities[ticker]
+        side = body.get("side") or ("short" if alert and alert["direction"] in ("up_plate",) else "long")
+        if side not in ("long", "short"):
+            raise HTTPException(422, "side: long или short")
+        entry = float(body.get("entry_price") or sec.get("last") or (alert or {}).get("price") or 0)
+        if entry <= 0:
+            raise HTTPException(422, "Нет цены входа")
+        extra = (alert or {}).get("extra") or {}
+        stop = body.get("stop", extra.get("stop"))
+        take = body.get("take", extra.get("take"))
+        if stop is None or take is None:  # по умолчанию — от дневного ATR
+            s = db.effective_settings(user["id"])
+            atr_pct = sec.get("daily_atr_pct") or 2.0
+            sign = 1 if side == "long" else -1
+            stop = stop if stop is not None else entry * (1 - sign * s["stop_atr_mult"] * atr_pct / 100)
+            take = take if take is not None else entry * (1 + sign * s["take_atr_mult"] * atr_pct / 100)
+        cur = db.execute(
+            "INSERT INTO paper_trades (key_id, ticker, side, entry_price, stop, take, alert_id, note, opened_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (user["id"], ticker, side, entry, float(stop), float(take), body.get("alert_id"),
+             str(body.get("note") or "")[:300], fmt_ts(now_msk())))
+        return {"id": cur.lastrowid, **(await api_paper(user))}
+
+    @app.post("/api/paper/{trade_id}/close")
+    async def api_paper_close(trade_id: int, body: dict | None = None, user: dict = Depends(current_user)):
+        t = db.query_one("SELECT * FROM paper_trades WHERE id = ? AND key_id = ?", (trade_id, user["id"]))
+        if not t or t["status"] != "open":
+            raise HTTPException(404, "Открытая сделка не найдена")
+        price = float((body or {}).get("price") or (scanner.securities.get(t["ticker"]) or {}).get("last") or 0)
+        if price <= 0:
+            raise HTTPException(422, "Нет цены выхода")
+        sign = 1 if t["side"] == "long" else -1
+        pct = (price - t["entry_price"]) / t["entry_price"] * 100 * sign
+        db.execute("UPDATE paper_trades SET status = 'manual', exit_price = ?, closed_at = ?, result_pct = ? "
+                   "WHERE id = ?", (price, fmt_ts(now_msk()), round(pct, 3), trade_id))
+        return await api_paper(user)
+
+    @app.delete("/api/paper/{trade_id}")
+    async def api_paper_delete(trade_id: int, user: dict = Depends(current_user)):
+        db.execute("DELETE FROM paper_trades WHERE id = ? AND key_id = ?", (trade_id, user["id"]))
+        return await api_paper(user)
+
+    # ============================================================ статика
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+    @app.get("/sw.js")
+    async def sw():
+        # Service worker с корня — scope на весь сайт
+        return FileResponse(STATIC_DIR / "sw.js", media_type="application/javascript",
+                            headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+    @app.get("/manifest.webmanifest")
+    async def manifest():
+        return FileResponse(STATIC_DIR / "manifest.webmanifest", media_type="application/manifest+json")
+
+    @app.get("/")
+    async def index():
+        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    return app
+
+
+def _ev(ev: al.Evaluation) -> dict[str, Any]:
+    return {"triggered": ev.triggered, "closeness": ev.closeness, "checks": ev.checks, "failed": ev.failed}
