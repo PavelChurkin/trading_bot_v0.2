@@ -12,3 +12,4 @@ venv/
 ci-logs/
 data-demo/
 config-demo/
+.playwright-mcp/

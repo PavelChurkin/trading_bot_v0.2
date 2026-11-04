@@ -289,8 +289,12 @@ def create_app(ctx: AppContext) -> FastAPI:
         w = int(s["candle_window_min"])
         snap = db.snapshot(ticker, w)
         series = charts.ticker_series(db, ticker, w, max(1, min(days, 14)))
-        alerts_rows = db.query("SELECT * FROM alerts WHERE (key_id IS NULL OR key_id = ?) AND ticker = ? "
-                               "ORDER BY ts DESC, id DESC LIMIT 30", (user["id"], ticker))
+        # Свои алерты (с отметкой пуша) + общий журнал там, где своего нет — без дублей
+        alerts_rows = db.query(
+            "SELECT * FROM alerts a WHERE a.ticker = ? AND (a.key_id = ? OR (a.key_id IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM alerts m WHERE m.key_id = ? AND m.ticker = a.ticker AND m.ts = a.ts "
+            "AND m.direction = a.direction))) ORDER BY a.ts DESC, a.id DESC LIMIT 30",
+            (ticker, user["id"], user["id"]))
         last_detail = db.get_state(f"analysis:{ticker}")
         return {"ticker": ticker, "security": scanner.securities[ticker], "row": _row(ticker, snap, s),
                 "snapshot": snap, "evaluation": _ev(al.evaluate(snap, s)) if snap else None,

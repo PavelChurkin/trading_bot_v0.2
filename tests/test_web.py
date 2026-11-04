@@ -164,6 +164,17 @@ def test_table_ticker_silent_and_metrics(env):
     assert card["series"]["candles"] and "price" in card["charts"] and "rsi" in card["charts"]
     assert c.get("/api/ticker/NOPE").status_code == 404
 
+    # Свой алерт и тот же алерт в общем журнале — в карточке один раз, свой
+    db, me = env["db"], c.get("/api/me").json()["user"]["id"]
+    for kid in (None, me):
+        db.execute("INSERT INTO alerts (key_id, ticker, ts, direction, score, reason, action) VALUES "
+                   "(?, 'PULS', '2026-01-05 12:00:00', 'up_pulse', 70, 'тест', 'enter')", (kid,))
+    db.execute("INSERT INTO alerts (key_id, ticker, ts, direction, score, reason, action) VALUES "
+               "(NULL, 'PULS', '2026-01-05 12:15:00', 'down_pulse', 60, 'только журнал', 'selloff')")
+    card_alerts = c.get("/api/ticker/PULS").json()["alerts"]
+    assert [(a["ts"], a["direction"]) for a in card_alerts] == [
+        ("2026-01-05 12:15:00", "down_pulse"), ("2026-01-05 12:00:00", "up_pulse")]
+
     silent = c.get("/api/silent").json()
     assert [r["ticker"] for r in silent["triggered"]] == ["PULS"]
     calm = silent["silent"][0]
