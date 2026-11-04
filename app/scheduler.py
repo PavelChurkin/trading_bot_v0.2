@@ -193,6 +193,7 @@ class RequestScheduler:
             item = self.queue.get_nowait()
             if not item.job.future.done():
                 item.job.future.cancel()
+        self._pending.clear()  # иначе повторный submit с тем же dedup_key вернёт отменённый future
 
     async def _run(self) -> None:
         while self._running:
