@@ -46,7 +46,9 @@ def stdin_watcher(loop: asyncio.AbstractEventLoop, stop) -> None:
             print("Введите 0 и Enter, чтобы остановить сервер.", flush=True)
 
 
-async def main() -> None:
+async def main(make_iss=None, prepare=None, banner: str = "") -> None:
+    """``make_iss(scheduler, cfg)`` — подмена клиента ISS (офлайн-демо),
+    ``prepare(db, scanner)`` — корутина, выполняется после старта планировщика."""
     cfg = AppConfig.from_env()
     cfg.ensure_dirs()
     admin_key, created = load_or_create_admin_key(cfg.admin_key_path)
@@ -54,7 +56,7 @@ async def main() -> None:
     auth.sync_admin_key(db, admin_key)
 
     scheduler = RequestScheduler(TokenBucket(cfg.requests_per_second, 1.0))
-    iss = IssClient(scheduler, cfg.iss_base_url)
+    iss = make_iss(scheduler, cfg) if make_iss else IssClient(scheduler, cfg.iss_base_url)
     push = PushService(db, cfg.vapid_key_path, cfg.vapid_subject)
     scanner = Scanner(db, iss, scheduler, push)
 
@@ -72,6 +74,8 @@ async def main() -> None:
 
     url = f"http://{'127.0.0.1' if cfg.host in ('0.0.0.0', '::') else cfg.host}:{cfg.port}"
     print("=" * 64)
+    if banner:
+        print(f"  {banner}")
     print(f"  Дашборд:      {url}")
     print(f"  Ключ админа:  {admin_key}" + ("  (создан сейчас)" if created else ""))
     print(f"  Файл ключа:   {cfg.admin_key_path}")
@@ -86,6 +90,8 @@ async def main() -> None:
     threading.Thread(target=stdin_watcher, args=(loop, stop), daemon=True, name="stdin").start()
 
     scheduler.start()
+    if prepare is not None:
+        await prepare(db, scanner)
     tasks = [asyncio.create_task(server.serve(), name="web")]
     if cfg.scanner_enabled:
         tasks.append(asyncio.create_task(scanner.run(), name="scanner"))

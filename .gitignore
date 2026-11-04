@@ -10,3 +10,5 @@ __pycache__/
 .venv/
 venv/
 ci-logs/
+data-demo/
+config-demo/
