@@ -158,8 +158,8 @@ tr.hot td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 .v-SELL .label { color: var(--down); }
 .v-HOLD .label { color: var(--warn); }
 .v-LATE .label { color: var(--warn); }
-ul.plain { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; }
-ul.plain li { font-size: 13px; }
+ul.plain, ol.plain { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; }
+ul.plain li, ol.plain li { font-size: 13px; }
 
 /* --- графики --- */
 .chart { position: relative; width: 100%; }

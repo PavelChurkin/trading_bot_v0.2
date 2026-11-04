@@ -566,8 +566,19 @@ def create_app(ctx: AppContext) -> FastAPI:
     async def index():
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", NoCacheStatic(directory=STATIC_DIR), name="static")
     return app
+
+
+class NoCacheStatic(StaticFiles):
+    """Статика с ``Cache-Control: no-cache``: браузер каждый раз сверяет ETag
+    (304 без тела, если файл не менялся), поэтому после обновления бота
+    сразу получает новые app.js/style.css, а не эвристически закэшированные."""
+
+    def file_response(self, *args: Any, **kwargs: Any):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
 
 def _ev(ev: al.Evaluation) -> dict[str, Any]:

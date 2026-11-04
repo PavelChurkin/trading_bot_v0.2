@@ -218,4 +218,6 @@ def test_pwa_assets_served(env):
     assert manifest.status_code == 200 and manifest.json()["display"] == "standalone"
     index = c.get("/")
     assert index.status_code == 200 and "manifest.webmanifest" in index.text
-    assert c.get("/static/app.js").status_code == 200
+    js = c.get("/static/app.js")
+    assert js.status_code == 200 and js.headers["cache-control"] == "no-cache"
+    assert c.get("/static/app.js", headers={"If-None-Match": js.headers["etag"]}).status_code == 304
