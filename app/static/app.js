@@ -17,6 +17,10 @@
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
   const num = (v, nd) => TB.fmt(v, nd);
+  // Близость к порогу в %: не сработавшее не показываем как «100%» (0.996 → 99%)
+  const closePct = (v, triggered) => ((triggered ?? (v >= 1)) ? 100 : Math.min(99, Math.floor((v || 0) * 100)));
+  const COND = { amplitude: "амплитуда", volume: "объём", level: "пробой уровня", plate: "плита" };
+  const condLabels = (failed) => (failed || "").split(",").filter(Boolean).map((c) => COND[c] || c).join(", ");
   function pct(v, nd) {
     if (v === null || v === undefined) return '<span class="muted">—</span>';
     const cls = v > 0 ? "up" : v < 0 ? "down" : "";
@@ -230,8 +234,8 @@
       case "impulse_age_min": return `<td class="num">${v ? num(v, 0) : "—"}${r.late ? ' <span class="tag warn">поздно</span>' : ""}</td>`;
       case "plate_score": return `<td class="num">${v === null || v === undefined ? "—" : v + "/4"}${v >= 3 ? ` <span class="tag ${r.direction < 0 ? "down" : "up"}">плита</span>` : ""}</td>`;
       case "threshold_closeness": {
-        const w = Math.min(1, v || 0) * 100;
-        return `<td class="num"><span class="closeness ${w >= 100 ? "full" : ""}"><i style="width:${w}%"></i></span>${num((v || 0) * 100, 0)}%</td>`;
+        const w = closePct(v, r.triggered);
+        return `<td class="num"><span class="closeness ${w >= 100 ? "full" : ""}"><i style="width:${w}%"></i></span>${w}%</td>`;
       }
       case "updated": return `<td class="num muted">${time(v)}</td>`;
       case "pullback_pct": case "amplitude_pct": return `<td class="num">${v === null || v === undefined ? "—" : num(v, 2)}</td>`;
@@ -426,7 +430,7 @@
           ${stat("Изм. за час", pct(row.change_hour_pct))}
           ${stat("Возраст импульса", row.impulse_age_min !== undefined ? num(row.impulse_age_min, 0) + " мин" + (row.late ? ' <span class="tag warn">поздно</span>' : "") : "—")}
           ${stat("Плита", row.plate_score !== undefined ? row.plate_score + "/4" : "—")}
-          ${stat("Близость к порогу", row.threshold_closeness !== undefined ? num(row.threshold_closeness * 100, 0) + "%" : "—")}
+          ${stat("Близость к порогу", row.threshold_closeness !== undefined ? closePct(row.threshold_closeness, row.triggered) + "%" : "—")}
           ${stat("ATR дня", sec.daily_atr_pct ? num(sec.daily_atr_pct, 2) + "%" : "—")}
         </div>
         ${ev ? checksHtml(ev) : '<p class="muted">Снапшота ещё нет — бумага не обработана в цикле.</p>'}
@@ -476,8 +480,8 @@
         <td class="num"><span class="closeness ${c.passed ? "full" : ""}"><i style="width:${Math.min(1, c.ratio || 0) * 100}%"></i></span>${num((c.ratio || 0) * 100, 0)}%</td>
         <td>${c.passed ? '<span class="tag up">да</span>' : '<span class="tag">нет</span>'}</td></tr>`).join("")}
       </tbody></table></div>
-      <p class="small">${ev.triggered ? '<span class="tag accent">триггер сработал</span>' : `Не хватает: ${esc(ev.failed.join(", "))}`} ·
-        близость ${num(ev.closeness * 100, 0)}%</p>`;
+      <p class="small">${ev.triggered ? '<span class="tag accent">триггер сработал</span>' : `Не хватает: ${esc(condLabels(ev.failed.join(",")))}`} ·
+        близость ${closePct(ev.closeness, ev.triggered)}%</p>`;
   }
 
   function drawCharts(box, s, chosen, labels) {
@@ -608,21 +612,21 @@
         <div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Тикер</th><th class="num">Близость</th><th class="num">Амп/ATR</th>
           <th class="num">Объём/ср.</th><th>Чего не хватило</th></tr></thead><tbody>
           ${r.silent.map((x) => `<tr class="click" data-t="${esc(x.ticker)}"><td><b>${esc(x.ticker)}</b></td>
-            <td class="num">${num(x.closeness * 100, 0)}%</td><td class="num">${num(x.amplitude_atr, 2)}</td><td class="num">×${num(x.volume_ratio, 2)}</td>
-            <td class="small">${x.checks.filter((c) => !c.passed).map((c) => `${esc(c.label)}: ${num(c.value, 2)} из ${num(c.threshold, 2)}`).join("; ")}</td></tr>`).join("")}
+            <td class="num">${closePct(x.closeness, false)}%</td><td class="num">${num(x.amplitude_atr, 2)}</td><td class="num">×${num(x.volume_ratio, 2)}</td>
+            <td class="small wrap">${x.checks.filter((c) => !c.passed).map((c) => `${esc(c.label)}: ${num(c.value, 2)} из ${num(c.threshold, 2)}`).join("; ")}</td></tr>`).join("")}
         </tbody></table></div></div>
       <div class="card"><div class="row between"><h2>Журнал решений</h2>
         <select id="cyc">${d.cycles.map((c) => `<option value="${c.cycle_id}" ${c.cycle_id === d.cycle_id ? "selected" : ""}>
           цикл #${c.cycle_id} · ${esc(String(c.ts).slice(5, 16))} · ${c.passed}/${c.n}</option>`).join("")}</select></div>
         <p class="muted small">Строка на тикер × цикл, глобальные пороги админа.</p><div id="dec"></div></div></div>`;
     TB.bars($("#cl"), r.silent.slice(0, 15).map((x) => ({ label: x.ticker, value: x.closeness, max: 1,
-      text: num(x.closeness * 100, 0) + "%", onclick: () => go("ticker/" + x.ticker) })), { max: 1 });
+      text: closePct(x.closeness, false) + "%", onclick: () => go("ticker/" + x.ticker) })), { max: 1 });
     $$("tr[data-t]", view).forEach((tr) => tr.addEventListener("click", () => go("ticker/" + tr.dataset.t)));
     const drawDec = (rows) => {
       $("#dec").innerHTML = rows.length ? `<div class="table-wrap"><table><thead><tr><th>Тикер</th><th>Решение</th><th class="num">Близость</th>
         <th>Не прошло</th></tr></thead><tbody>${rows.map((x) => `<tr><td><a href="#ticker/${esc(x.ticker)}">${esc(x.ticker)}</a></td>
-        <td>${x.passed ? '<span class="tag up">прошёл</span>' : '<span class="tag">нет</span>'}</td><td class="num">${num((x.closeness || 0) * 100, 0)}%</td>
-        <td class="small">${esc(x.failed || "")}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty">Журнал пуст — дождитесь цикла</div>';
+        <td>${x.passed ? '<span class="tag up">прошёл</span>' : '<span class="tag">нет</span>'}</td><td class="num">${closePct(x.closeness, x.passed)}%</td>
+        <td class="small">${x.passed ? '<span class="muted">—</span>' : esc(condLabels(x.failed))}</td></tr>`).join("")}</tbody></table></div>` : '<div class="empty">Журнал пуст — дождитесь цикла</div>';
     };
     drawDec(d.decisions);
     if ($("#cyc")) $("#cyc").addEventListener("change", async () => drawDec((await api("/api/decisions?cycle_id=" + $("#cyc").value)).decisions));

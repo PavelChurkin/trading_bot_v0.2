@@ -137,6 +137,7 @@ th { position: sticky; top: 0; background: var(--surface); color: var(--muted); 
 th.sorted::after { content: " ↓"; color: var(--accent); }
 th.sorted.asc::after { content: " ↑"; }
 td.num, th.num { text-align: right; }
+td.wrap { white-space: normal; min-width: 220px; }
 tbody tr:hover { background: #121a2c99; }
 tbody tr.click { cursor: pointer; }
 tr.hot td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
