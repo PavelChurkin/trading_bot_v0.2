@@ -223,6 +223,10 @@ pytest
 | ![Метрики](docs/screenshots/08-metrics.png) | ![Настройки](docs/screenshots/09-settings.png) |
 | ![Админ](docs/screenshots/10-admin.png) | ![Телефон](docs/screenshots/11-mobile-market.png) |
 
+После живого цикла на реальном ISS (502 бумаги TQBR):
+
+![Рынок, реальные данные](docs/screenshots/12-live-market.png)
+
 ## Структура
 
 ```
