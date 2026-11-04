@@ -49,6 +49,9 @@ def stdin_watcher(loop: asyncio.AbstractEventLoop, stop) -> None:
 async def main(make_iss=None, prepare=None, banner: str = "") -> None:
     """``make_iss(scheduler, cfg)`` — подмена клиента ISS (офлайн-демо),
     ``prepare(db, scanner)`` — корутина, выполняется после старта планировщика."""
+    # httpx пишет INFO на каждый запрос (~500 строк за цикл) — оставляем только проблемы;
+    # 429/5xx/ретраи логирует сам планировщик.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = AppConfig.from_env()
     cfg.ensure_dirs()
     admin_key, created = load_or_create_admin_key(cfg.admin_key_path)

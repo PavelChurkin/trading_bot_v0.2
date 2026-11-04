@@ -102,7 +102,7 @@ class IssClient:
         """Список акций режима TQBR (кэш — сутки)."""
         data = await self.get(SHARES + "/securities", {
             "iss.only": "securities",
-            "securities.columns": "SECID,SHORTNAME,SECNAME,PREVPRICE,LOTSIZE",
+            "securities.columns": "SECID,SHORTNAME,SECNAME,PREVPRICE,PREVDATE,LOTSIZE",
         }, cache_ttl=TTL_SECURITIES)
         return table(data, "securities")
 

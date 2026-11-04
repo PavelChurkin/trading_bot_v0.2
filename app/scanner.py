@@ -188,7 +188,8 @@ class Scanner:
             rows.append(row)
             old = self.securities.get(t, {})
             # Активная бумага — есть цена (отсекает делистинг и бумаги без торгов)
-            self.securities[t] = {**old, **row, "active": bool(prev and prev > 0)}
+            self.securities[t] = {**old, **row, "prev_date": sec.get("PREVDATE") or old.get("prev_date"),
+                                  "active": bool(prev and prev > 0)}
         with self.db.transaction() as conn:
             conn.executemany(
                 "INSERT INTO securities (ticker, name, full_name, lot, prev_price, last, open, high, low, volume_today, "
@@ -212,9 +213,15 @@ class Scanner:
 
     async def fetch_tail(self, ticker: str, priority: int = P1) -> int:
         frm = self.tail_from(ticker)
+        cold = self.db.last_candle_ts(ticker) is None
+        prev_date = (self.securities.get(ticker) or {}).get("prev_date")
 
         async def job() -> int:
             rows = await self.iss.candles(ticker, 1, frm)
+            if not rows and cold and prev_date and prev_date < frm[:10]:
+                # Холодный старт до открытия/в день без торгов: берём прошлую
+                # сессию (PREVDATE из ISS), иначе таблица пуста до первой сделки.
+                rows = await self.iss.candles(ticker, 1, prev_date, prev_date)
             return self.db.upsert_candles(ticker, rows)
 
         return await self.scheduler.submit(priority, f"candles {ticker} from={frm}", job,

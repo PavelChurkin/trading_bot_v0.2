@@ -200,3 +200,45 @@ def test_paper_trade_take_and_stop(db):
     long_t, short_t = db.query("SELECT * FROM paper_trades ORDER BY id")
     assert long_t["status"] == "take" and long_t["result_pct"] > 0
     assert short_t["status"] == "stop" and short_t["result_pct"] < 0
+
+
+def test_cold_start_without_today_candles_uses_prev_session(db):
+    """Запуск до открытия / в день без торгов: сегодня свечей нет — берём
+    прошлую сессию по PREVDATE, чтобы таблица не была пустой."""
+    yesterday = (date.fromisoformat(TODAY) - timedelta(days=1)).isoformat()
+
+    class PrevDayIss(FakeIss):
+        def __init__(self):
+            super().__init__()
+            self.minute = {"PULS": pulse_day(yesterday), "CALM": flat_minutes(f"{yesterday} 10:00:00", 315, 50.0)}
+
+        async def securities(self):
+            return [{**s, "PREVDATE": yesterday} for s in await super().securities()]
+
+        async def candles(self, ticker, interval, frm, till=None):
+            self.calls.append((ticker, interval, frm, till))
+            if interval == 24:
+                return daily_history(self.minute[ticker][0]["open"])
+            till = (till or "9999-12-31") + " 23:59:59"
+            return [c for c in self.minute.get(ticker, []) if frm <= c["ts"] <= till]
+
+    sched = RequestScheduler(TokenBucket(1000, 50))
+    scanner = Scanner(db, PrevDayIss(), sched, FakePush())
+
+    async def scenario():
+        sched.start()
+        try:
+            first = await scanner.run_cycle()
+            calls_after_first = list(scanner.iss.calls)
+            await scanner.run_cycle()
+            return first, calls_after_first
+        finally:
+            await sched.stop()
+
+    info, calls = run(scenario())
+    assert info["no_data"] == 0
+    assert db.last_candle_ts("CALM")[:10] == yesterday
+    assert ("CALM", 1, yesterday, yesterday) in calls  # догрузка прошлой сессии
+    # Второй цикл: свечи уже есть — прошлую сессию повторно не тянем
+    later = scanner.iss.calls[len(calls):]
+    assert not [c for c in later if c[0] == "CALM" and c[1] == 1 and c[2] == yesterday]
