@@ -215,6 +215,14 @@ class Database:
             (ticker, since_ts),
         )
 
+    def last_candles(self, ticker: str, limit: int) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT ts, open, high, low, close, volume, value FROM candles WHERE ticker = ? ORDER BY ts DESC LIMIT ?",
+            (ticker, int(limit)),
+        )
+        rows.reverse()
+        return rows
+
     def candle_days(self, ticker: str) -> list[str]:
         rows = self.query("SELECT DISTINCT substr(ts, 1, 10) AS d FROM candles WHERE ticker = ? ORDER BY d", (ticker,))
         return [r["d"] for r in rows]

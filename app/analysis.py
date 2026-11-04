@@ -14,11 +14,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Optional, Sequence
 
 from . import indicators as ind
-from .timeutil import MSK, fmt_ts, parse_ts
+from .timeutil import fmt_ts, parse_ts
 
 
 def _sign(x: float) -> int:
@@ -501,6 +501,3 @@ def make_verdict(price: float, day_change_pct: Optional[float], day: dict[str, A
         "stop": _r(stop, 4), "take": _r(take, 4), "risk_reward": _r(rr, 2),
     }
 
-
-def ts_now_str() -> str:
-    return fmt_ts(datetime.now(MSK))

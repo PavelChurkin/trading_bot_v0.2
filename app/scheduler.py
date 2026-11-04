@@ -138,7 +138,6 @@ class RequestScheduler:
         self.completed = {P0: 0, P1: 0, P2: 0}
         self.retries = 0
         self.failed = 0
-        self.p1_lag_sec: float = 0.0
         self.p1_cycle: dict[str, Any] = {}
         self.order_log: deque[tuple[int, str]] = deque(maxlen=200)  # для тестов и отладки
 
@@ -160,6 +159,13 @@ class RequestScheduler:
             self._pending[dedup_key] = job
         self.queue.put_nowait(_Item(priority, next(self._seq), job))
         return fut
+
+    def p1_lag(self) -> float:
+        """Лаг P1: сколько секунд ждёт самая старая задача регулярного обхода."""
+        now = time.monotonic()
+        waits = [now - item.job.enqueued_at for item in list(self.queue._queue)  # type: ignore[attr-defined]
+                 if item.priority == P1 and item.job.priority == P1 and not item.job.future.done()]
+        return max(waits, default=0.0)
 
     def queue_lengths(self) -> dict[str, int]:
         counts = {P0: 0, P1: 0, P2: 0}
@@ -270,7 +276,7 @@ class RequestScheduler:
             "completed": {PRIORITY_NAMES[p]: n for p, n in self.completed.items()},
             "retries": self.retries,
             "failed": self.failed,
-            "p1_lag_sec": round(self.p1_lag_sec, 1),
+            "p1_lag_sec": round(self.p1_lag(), 1),
             "p1_cycle": self.p1_cycle,
             "rate_limit_rps": self.bucket.rate,
             "recent_errors": [{"ts": t, "error": e} for t, e in list(self.errors)[-10:]],
