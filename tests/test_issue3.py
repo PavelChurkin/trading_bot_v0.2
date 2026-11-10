@@ -426,3 +426,14 @@ def test_hold_actions_can_be_muted_in_schema():
 def test_cycle_context_has_warmup_flag():
     assert CycleContext(1, []).warmup is False
     assert FakePush().sent == [] and FakeIss().orderbook_available is False
+
+
+def test_approach_metrics_intensity_and_peak_forecast():
+    """п. 21 (гипотеза): ускорение к сопротивлению на растущем объёме."""
+    wc = flat_bars(10) + [bar(100, 100.5, 2000), bar(100.5, 101.2, 3000), bar(101.2, 102.1, 4500)]
+    m = an.approach_metrics(wc, 0.5, level_high=102.6, level_low=99.0)
+    assert m["approach_speed_atr"] > 0 and m["approach_intensity"] > m["approach_speed_atr"]
+    assert m["approach_level"] == 102.6 and m["approach_distance_atr"] == 1.0
+    assert 102.1 < m["pump_peak_forecast"] <= 102.6 + 0.5  # потолок: уровень + 1 ATR
+    down = an.approach_metrics(list(reversed(wc)), 0.5, level_high=102.6, level_low=99.0)
+    assert down["approach_speed_atr"] < 0 and down["pump_peak_forecast"] is None
