@@ -118,6 +118,21 @@ class Database:
             if self.path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    # Колонки, добавленные после первого релиза: (таблица, колонка, тип)
+    MIGRATIONS = (
+        ("securities", "sectype", "TEXT"),
+        ("paper_trades", "qty", "REAL"),
+        ("paper_trades", "profit_rub", "REAL"),
+        ("paper_trades", "notified", "TEXT"),
+    )
+
+    def _migrate(self) -> None:
+        for table, col, typ in self.MIGRATIONS:
+            cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
 
     def close(self) -> None:
         with self._lock:
@@ -259,8 +274,9 @@ class Database:
     def purge_older_than(self, days: int) -> dict[str, int]:
         cutoff = fmt_ts(now_msk() - timedelta(days=max(days, 1)))
         out = {}
-        for table in ("candles", "metrics", "decisions"):
+        for table in ("candles", "metrics", "decisions", "alerts"):
             cur = self.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
             out[table] = cur.rowcount
+        out["daily_reports"] = self.execute("DELETE FROM daily_reports WHERE day < ?", (cutoff[:10],)).rowcount
         self.execute("DELETE FROM sessions WHERE expires_at < ?", (fmt_ts(now_msk()),))
         return out
