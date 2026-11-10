@@ -133,18 +133,20 @@ class Database:
             cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
-        # issue #3: колонка «Действия» (кнопка Paper) в уже сохранённых наборах колонок — один раз
-        done = self._conn.execute(
-            "SELECT 1 FROM settings WHERE scope = 'state' AND key = 'migr_actions_column'").fetchone()
-        if not done:
-            for scope, value in self._conn.execute(
-                    "SELECT scope, value FROM settings WHERE key = 'dashboard_columns'").fetchall():
-                cols = json.loads(value)
-                if isinstance(cols, list) and "actions" not in cols:
-                    self._conn.execute("UPDATE settings SET value = ? WHERE scope = ? AND key = 'dashboard_columns'",
-                                       (json.dumps(cols + ["actions"], ensure_ascii=False), scope))
-            self._conn.execute("INSERT OR REPLACE INTO settings (scope, key, value) "
-                               "VALUES ('state', 'migr_actions_column', 'true')")
+        # issue #3, один раз: новые значения в уже сохранённых списках — колонка «Действия»
+        # (кнопка Paper) и тип алерта «Памп» (иначе поиск пампов молча глушился бы «тип отключён»)
+        for marker, key, item in (("migr_actions_column", "dashboard_columns", "actions"),
+                                  ("migr_pump_alert_type", "alert_types", "pump")):
+            done = self._conn.execute("SELECT 1 FROM settings WHERE scope = 'state' AND key = ?", (marker,)).fetchone()
+            if done:
+                continue
+            for scope, value in self._conn.execute("SELECT scope, value FROM settings WHERE key = ?", (key,)).fetchall():
+                vals = json.loads(value)
+                if isinstance(vals, list) and item not in vals:
+                    self._conn.execute("UPDATE settings SET value = ? WHERE scope = ? AND key = ?",
+                                       (json.dumps(vals + [item], ensure_ascii=False), scope, key))
+            self._conn.execute("INSERT OR REPLACE INTO settings (scope, key, value) VALUES ('state', ?, 'true')",
+                               (marker,))
 
     def close(self) -> None:
         with self._lock:

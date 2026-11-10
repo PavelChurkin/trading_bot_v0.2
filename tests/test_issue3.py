@@ -461,6 +461,25 @@ def test_actions_column_default_and_migration(tmp_path):
     d.close()
 
 
+
+def test_pump_alert_type_migration(tmp_path):
+    """п. 20: у пользователей с сохранённым списком типов «Памп» добавляется
+    один раз — иначе включённый поиск пампов глушился бы «тип отключён»."""
+    from app.db import Database
+
+    path = tmp_path / "p.sqlite3"
+    d = Database(path)
+    d.save_settings("user:7", {"alert_types": ["up_pulse"]})
+    d.execute("DELETE FROM settings WHERE scope = 'state' AND key = 'migr_pump_alert_type'")
+    d.close()
+    d = Database(path)
+    assert d.effective_settings(7)["alert_types"] == ["up_pulse", "pump"]
+    d.save_settings("user:7", {"alert_types": ["up_pulse"]})  # выключил сам — не возвращаем
+    d.close()
+    d = Database(path)
+    assert d.effective_settings(7)["alert_types"] == ["up_pulse"]
+    d.close()
+
 def test_board_restored_from_db_after_restart(db):
     """Рестарт ночью (цикла нет до 07:00): доска из БД остаётся активной,
     иначе таблица «Рынок» показывает 0 бумаг."""
