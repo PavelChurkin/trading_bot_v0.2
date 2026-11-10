@@ -39,10 +39,11 @@ logger = logging.getLogger(__name__)
 
 # Настройки, от которых зависит снапшот (наборы с одинаковыми значениями считаются один раз)
 SNAPSHOT_KEYS = ("candle_window_min", "volume_avg_window", "level_window", "plate_series_n", "plate_jerk_atr",
-                 "plate_pullback_max_pct", "plate_volume_mult", "plate_move_atr_k")
+                 "plate_pullback_max_pct", "plate_volume_mult", "plate_move_atr_k", "plate_use_series",
+                 "plate_use_no_correction", "plate_use_volume", "plate_use_move", "plate_min_score")
 BLUE_CHIPS = ["SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "GMKN", "PLZL", "ALRS", "MGNT"]
 SNAPSHOT_METRICS = ("price", "amplitude_atr", "amplitude_pct", "volume_ratio", "atr", "change_hour_pct",
-                    "impulse_age_min", "plate_score", "level_distance_atr", "pullback_pct")
+                    "impulse_age_min", "plate_score", "level_distance_atr", "pullback_pct", "approach_intensity")
 P0_METRICS = ("rsi", "macd_line", "macd_signal", "macd_hist", "stoch_k", "stoch_d", "bb_upper", "bb_lower",
               "bb_middle")
 

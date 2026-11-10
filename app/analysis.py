@@ -77,16 +77,33 @@ def aggregate(candles: Sequence[dict[str, Any]], window_min: int, complete_only:
 def detect_plate(wc: Sequence[dict[str, Any]], atr_series: Sequence[float], s: dict[str, Any]) -> dict[str, Any]:
     """Детектор плиты (п. 22) по последним N свечам окна.
 
-    Четыре признака: односторонняя серия (или одиночный рывок), отсутствие
-    коррекции, аномальный объём каждой свечи, ход серии > k×ATR.
-    Отсутствие коррекции — обязательный признак (отличает плиту от
-    органического ступенчатого тренда). 3 из 4 — «плита», 4 из 4 — уверенно.
+    Четыре признака (каждый можно отключить в настройках группы «Плита»):
+
+    1. ``series`` — N свечей подряд в одну сторону или одиночный рывок
+       телом ≥ ``plate_jerk_atr`` × ATR;
+    2. ``no_correction`` — встречные движения (откаты close-to-close плюс
+       встречные тени) составляют < ``plate_pullback_max_pct`` % пройденного
+       пути. Если признак учитывается — он обязательный (отличает плиту от
+       органического ступенчатого тренда);
+    3. ``volume`` — объём каждой свечи серии ≥ ``plate_volume_mult`` × среднего;
+    4. ``move`` — ход серии ≥ ``plate_move_atr_k`` × ATR.
+
+    «Плита» — выполнено ≥ ``plate_min_score`` из учитываемых признаков,
+    «уверенно» — выполнены все учитываемые.
     """
     n = int(s["plate_series_n"])
+    use = {
+        "series": bool(s.get("plate_use_series", True)),
+        "no_correction": bool(s.get("plate_use_no_correction", True)),
+        "volume": bool(s.get("plate_use_volume", True)),
+        "move": bool(s.get("plate_use_move", True)),
+    }
+    enabled = sum(use.values())
+    need = min(int(s.get("plate_min_score", 3)), enabled)
     empty = {"score": 0, "is_plate": False, "confident": False, "direction": 0, "move_pct": 0.0,
              "move_atr": 0.0, "pullback_pct": 100.0, "series": False, "no_correction": False,
-             "volume": False, "move": False, "n": n}
-    if len(wc) < n + 1:
+             "volume": False, "move": False, "n": n, "enabled": enabled, "need": need}
+    if len(wc) < n + 1 or enabled == 0:
         return empty
     seg = wc[-n:]
     before = wc[:-n]
@@ -106,7 +123,10 @@ def detect_plate(wc: Sequence[dict[str, Any]], atr_series: Sequence[float], s: d
         pullback += max(adverse, 0.0)
         pullback += (c["high"] - c["close"]) if direction > 0 else (c["close"] - c["low"])
         prev_close = c["close"]
-    pullback_pct = pullback / abs(move) * 100
+    # Доля встречных движений во всём пройденном пути: 0..100 %. Раньше делили
+    # на чистый ход серии, и при ходе ≈ 0 получались 500 %…11800 % (issue #3).
+    path = abs(move) + pullback
+    pullback_pct = pullback / path * 100 if path > 0 else 0.0
     vol_window = before[-int(s["volume_avg_window"]):]
     vol_avg = sum(c["volume"] for c in vol_window) / len(vol_window) if vol_window else 0.0
     volume_ok = vol_avg > 0 and all(c["volume"] >= s["plate_volume_mult"] * vol_avg for c in seg)
@@ -117,13 +137,62 @@ def detect_plate(wc: Sequence[dict[str, Any]], atr_series: Sequence[float], s: d
         "volume": bool(volume_ok),
         "move": move_atr >= s["plate_move_atr_k"],
     }
-    score = sum(flags.values())
-    is_plate = flags["no_correction"] and score >= 3
+    score = sum(1 for k, v in flags.items() if v and use[k])
+    mandatory_ok = flags["no_correction"] or not use["no_correction"]
+    is_plate = mandatory_ok and score >= need
     return {
-        **flags, "score": score, "is_plate": is_plate, "confident": score == 4, "direction": direction,
-        "jerk": bool(jerk), "move_pct": _r(move / seg[0]["open"] * 100, 3), "move_atr": _r(move_atr, 3),
-        "pullback_pct": _r(pullback_pct, 2), "n": n,
+        **flags, "score": score, "is_plate": is_plate, "confident": is_plate and score == enabled,
+        "direction": direction, "jerk": bool(jerk), "move_pct": _r(move / seg[0]["open"] * 100, 3),
+        "move_atr": _r(move_atr, 3), "pullback_pct": _r(pullback_pct, 2), "n": n,
+        "enabled": enabled, "need": need, "use": use,
     }
+
+
+def approach_metrics(wc: Sequence[dict[str, Any]], atr: float, level_high: Optional[float],
+                     level_low: Optional[float], k: int = 3) -> dict[str, Any]:
+    """Гипотеза issue #3 (п. 21): интенсивность движения к уровню.
+
+    ``approach_speed_atr`` — средняя скорость цены за последние ``k`` окон в
+    ATR за окно, со знаком «к ближайшему уровню по ходу движения» (вверх —
+    к сопротивлению, вниз — к поддержке). ``approach_intensity`` — скорость ×
+    отношение объёма последних окон к предыдущим (ускорение на объёме).
+
+    ``pump_peak_forecast`` — экспериментальная оценка пика: если интенсивность
+    растёт, импульс по инерции проходит ещё ~скорость × (intensity/скорость)
+    окон; ограничиваем сверху расстоянием до уровня + 1 ATR (пробой) — пампы
+    часто «выдыхаются» у сопротивления либо через ATR после пробоя.
+    """
+    out = {"approach_speed_atr": 0.0, "approach_intensity": 0.0, "approach_level": None,
+           "approach_distance_atr": None, "pump_peak_forecast": None}
+    if len(wc) < k + 1 or atr <= 0:
+        return out
+    seg = wc[-k:]
+    prev = wc[-2 * k:-k] or wc[:1]
+    speed = (seg[-1]["close"] - wc[-k - 1]["close"]) / atr / k
+    vol_now = sum(c["volume"] for c in seg) / len(seg)
+    vol_prev = sum(c["volume"] for c in prev) / len(prev)
+    vol_k = vol_now / vol_prev if vol_prev > 0 else 1.0
+    price = seg[-1]["close"]
+    if speed >= 0:
+        level = level_high
+        dist = (level - price) / atr if level is not None else None
+    else:
+        level = level_low
+        dist = (price - level) / atr if level is not None else None
+    intensity = abs(speed) * vol_k
+    forecast = None
+    if speed > 0:
+        # Инерция: чем выше интенсивность — тем дальше «доедет» цена; потолок —
+        # уровень сопротивления + 1 ATR (если уже выше уровня — цена + 1 ATR).
+        run = abs(speed) * max(1.0, min(vol_k, 5.0)) * atr
+        ceiling = (max(level, price) if level is not None else price) + atr
+        forecast = min(price + run, ceiling)
+    out.update({
+        "approach_speed_atr": _r(speed, 3), "approach_intensity": _r(intensity, 3),
+        "approach_level": level, "approach_distance_atr": _r(dist, 3) if dist is not None else None,
+        "pump_peak_forecast": _r(forecast, 4) if forecast is not None else None,
+    })
+    return out
 
 
 def compute_snapshot(ticker: str, candles: Sequence[dict[str, Any]], s: dict[str, Any],
@@ -188,6 +257,7 @@ def compute_snapshot(ticker: str, candles: Sequence[dict[str, Any]], s: dict[str
     impulse_move_pct = (price - impulse_start) / impulse_start * 100 if impulse_start else 0.0
 
     plate = detect_plate(wc, atr_series, s)
+    approach = approach_metrics(wc, atr_ref, level_high, level_low)
     sec = security or {}
     return {
         "ticker": ticker,
@@ -216,6 +286,7 @@ def compute_snapshot(ticker: str, candles: Sequence[dict[str, Any]], s: dict[str
         "pullback_pct": plate["pullback_pct"],
         "plate": plate,
         "plate_score": plate["score"],
+        **approach,
         "day_change_pct": sec.get("day_change_pct"),
         "volume_today": sec.get("volume_today"),
         "value_today": sec.get("value_today"),
