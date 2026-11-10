@@ -437,3 +437,25 @@ def test_approach_metrics_intensity_and_peak_forecast():
     assert 102.1 < m["pump_peak_forecast"] <= 102.6 + 0.5  # потолок: уровень + 1 ATR
     down = an.approach_metrics(list(reversed(wc)), 0.5, level_high=102.6, level_low=99.0)
     assert down["approach_speed_atr"] < 0 and down["pump_peak_forecast"] is None
+
+
+def test_actions_column_default_and_migration(tmp_path):
+    """п. 13: колонка «Действия» с кнопкой Paper видна по умолчанию и
+    добавляется один раз в уже сохранённые наборы колонок."""
+    from app.db import Database
+
+    assert "actions" in ss.defaults()["dashboard_columns"]
+    path = tmp_path / "m.sqlite3"
+    d = Database(path)
+    d.save_settings("user:5", {"dashboard_columns": ["ticker", "price"]})
+    d.execute("DELETE FROM settings WHERE scope = 'state' AND key = 'migr_actions_column'")
+    d.close()
+    d = Database(path)
+    assert d.query_one("SELECT value FROM settings WHERE scope = 'user:5' AND key = 'dashboard_columns'")[
+        "value"] == '["ticker", "price", "actions"]'
+    d.save_settings("user:5", {"dashboard_columns": ["ticker"]})  # пользователь убрал — больше не трогаем
+    d.close()
+    d = Database(path)
+    assert json.loads(d.query_one("SELECT value FROM settings WHERE scope = 'user:5' AND key = 'dashboard_columns'")[
+        "value"]) == ["ticker"]
+    d.close()

@@ -215,8 +215,40 @@ class DemoIss:
     async def candles(self, ticker: str, interval: int, date_from: str, date_till: Optional[str] = None,
                       **_: Any) -> list[dict[str, Any]]:
         till = (date_till or "9999-12-31") + " 23:59:59"
+        if interval == 60:  # графики 14 дней / месяц (issue #3): часовые из дневных + свои минутки
+            return [c for c in self._hourly(ticker) if date_from <= c["ts"] <= till]
         src = self.daily if interval == 24 else self.minute
         return [c for c in src.get(ticker, []) if date_from <= c["ts"] <= till]
+
+    def _hourly(self, ticker: str) -> list[dict[str, Any]]:
+        """Часовые свечи: прошлые дни — синтетика внутри дневной свечи (9 часов
+        10:00–18:00), дни с минутками — агрегат минуток."""
+        minute = self.minute.get(ticker, [])
+        minute_days = {c["ts"][:10] for c in minute}
+        rnd = random.Random(f"h-{ticker}")
+        out: list[dict[str, Any]] = []
+        for d in self.daily.get(ticker, []):
+            day = d["ts"][:10]
+            if day in minute_days:
+                continue
+            price = d["open"]
+            for h in range(9):
+                close = d["close"] if h == 8 else price + (d["close"] - d["open"]) / 9 + rnd.gauss(0, 0.002) * price
+                close = min(max(close, d["low"]), d["high"])
+                out.append({"ts": f"{day} {10 + h:02d}:00:00", "open": price, "close": close,
+                            "high": max(price, close) * (1 + rnd.uniform(0, 0.002)),
+                            "low": min(price, close) * (1 - rnd.uniform(0, 0.002)),
+                            "volume": d["volume"] / 9, "value": d["volume"] / 9 * close})
+                price = close
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for c in minute:
+            buckets.setdefault(c["ts"][:13], []).append(c)
+        for key in sorted(buckets):
+            b = buckets[key]
+            out.append({"ts": f"{key}:00:00", "open": b[0]["open"], "close": b[-1]["close"],
+                        "high": max(c["high"] for c in b), "low": min(c["low"] for c in b),
+                        "volume": sum(c["volume"] for c in b), "value": sum(c.get("value") or 0 for c in b)})
+        return sorted(out, key=lambda c: c["ts"])
 
     async def orderbook(self, ticker: str, depth: int = 10) -> Optional[dict[str, Any]]:
         raise OrderbookUnavailable("демо: стакан недоступен")

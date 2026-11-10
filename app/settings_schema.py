@@ -204,7 +204,7 @@ SETTINGS: list[Setting] = [
     # --- Дашборд ---
     Setting("dashboard_columns", "list",
             ["ticker", "name", "price", "day_change_pct", "amplitude_atr", "volume_ratio", "change_hour_pct",
-             "level_break", "impulse_age_min", "plate_score"],
+             "level_break", "impulse_age_min", "plate_score", "actions"],
             "Колонки таблицы", "Дашборд", "user", choices=DASHBOARD_COLUMNS),
     Setting("charts", "list", list(CHARTS), "Графики в карточке тикера", "Дашборд", "user", choices=CHARTS),
 ]
