@@ -29,10 +29,35 @@ def _round(series: list[Optional[float]], nd: int = 4) -> list[Optional[float]]:
     return [None if v is None else round(v, nd) for v in series]
 
 
-def ticker_series(db: Database, ticker: str, window_min: int, days: int = 7) -> dict[str, Any]:
+# Длинные периоды (14 дней / месяц, issue #3) рисуем часовыми свечами — иначе
+# тысячи 15-минуток; график листается по горизонтали.
+LONG_RANGE_DAYS = 14
+LONG_RANGE_WINDOW = 60
+
+
+def chart_window(window_min: int, days: int) -> int:
+    return max(window_min, LONG_RANGE_WINDOW) if days >= LONG_RANGE_DAYS else window_min
+
+
+def local_covers(db: Database, ticker: str, days: int) -> bool:
+    """Покрывают ли локальные минутки период (с запасом в 2 дня на выходные)."""
+    row = db.query_one("SELECT MIN(ts) AS ts FROM candles WHERE ticker = ?", (ticker,))
+    if not row or not row["ts"]:
+        return False
+    return row["ts"] <= fmt_ts(now_msk() - timedelta(days=max(days - 2, 1)))
+
+
+def ticker_series(db: Database, ticker: str, window_min: int, days: int = 7,
+                  candles: Optional[list[dict[str, Any]]] = None, source: str = "local") -> dict[str, Any]:
+    """Серии для карточки тикера. ``candles`` — готовые свечи (например,
+    часовые из ISS для 14/30 дней, когда локальная история короче)."""
     since = fmt_ts(now_msk() - timedelta(days=days))
-    minute = db.candles_since(ticker, since)
-    wc = an.aggregate(minute, window_min, complete_only=False)
+    window_min = chart_window(window_min, days)
+    if candles is None:
+        minute = db.candles_since(ticker, since)
+        wc = an.aggregate(minute, window_min, complete_only=False)
+    else:
+        wc = [c for c in candles if c["ts"] >= since]
     closes = [c["close"] for c in wc]
     highs = [c["high"] for c in wc]
     lows = [c["low"] for c in wc]
@@ -42,6 +67,8 @@ def ticker_series(db: Database, ticker: str, window_min: int, days: int = 7) -> 
     out: dict[str, Any] = {
         "ticker": ticker,
         "window": window_min,
+        "days": days,
+        "source": source,
         "since": since,
         "candles": [[c["ts"], c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in wc],
         "indicators": {

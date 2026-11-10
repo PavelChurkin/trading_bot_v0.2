@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,7 +27,7 @@ from . import settings_schema as ss
 from .db import Database
 from .push import PushService
 from .scanner import BLUE_CHIPS, Scanner
-from .scheduler import RequestScheduler
+from .scheduler import P0, RequestScheduler
 from .timeutil import fmt_ts, now_msk
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,12 @@ def create_app(ctx: AppContext) -> FastAPI:
         scanner.request_cycle()
         return {"ok": True, "cycle_running": scanner.cycle_running}
 
+    @app.post("/api/admin/purge")
+    async def api_purge(user: dict = Depends(admin_user)):
+        """Очистка по сроку хранения прямо сейчас (обычно — раз в сутки в фоне)."""
+        days = int(db.global_settings()["retention_days"])
+        return {"ok": True, "days": days, "deleted": db.purge_older_than(days)}
+
     @app.post("/api/admin/stop")
     async def api_stop(user: dict = Depends(admin_user)):
         if ctx.stop_callback is None:
@@ -249,14 +256,15 @@ def create_app(ctx: AppContext) -> FastAPI:
     # ============================================================== таблица
     def _row(ticker: str, snap: Optional[dict[str, Any]], s: dict[str, Any]) -> dict[str, Any]:
         sec = scanner.securities.get(ticker) or {}
-        row = {"ticker": ticker, "name": sec.get("name"), "price": sec.get("last"),
+        row = {"ticker": ticker, "name": sec.get("name"), "price": sec.get("last"), "sectype": sec.get("sectype"),
                "day_change_pct": sec.get("day_change_pct"), "volume_today": sec.get("volume_today"),
                "value_today": sec.get("value_today"), "daily_atr_pct": sec.get("daily_atr_pct")}
         if snap:
             ev = al.evaluate(snap, s)
             row.update({k: snap.get(k) for k in ("amplitude_pct", "amplitude_atr", "atr", "volume", "volume_ratio",
                                                   "change_hour_pct", "level_break", "impulse_age_min",
-                                                  "pullback_pct", "plate_score", "direction", "level_distance_atr")})
+                                                  "pullback_pct", "plate_score", "direction", "level_distance_atr",
+                                                  "approach_intensity", "approach_speed_atr", "pump_peak_forecast")})
             row["price"] = snap.get("price") or row["price"]
             row["updated"] = snap.get("ts")
             row["threshold_closeness"] = ev.closeness
@@ -269,15 +277,18 @@ def create_app(ctx: AppContext) -> FastAPI:
         s = db.effective_settings(user["id"])
         snaps = db.snapshots(int(s["candle_window_min"]))
         favs = {r["ticker"] for r in db.query("SELECT ticker FROM favorites WHERE key_id = ?", (user["id"],))}
+        papers = _open_papers(user["id"])
         rows = []
         for t, sec in scanner.securities.items():
             if not sec.get("active"):
                 continue
             r = _row(t, snaps.get(t), s)
             r["favorite"] = t in favs
+            r["paper"] = papers.get(t)
             rows.append(r)
         rows.sort(key=lambda r: (-(r.get("threshold_closeness") or 0), r["ticker"]))
-        return {"columns": s["dashboard_columns"], "labels": ss.DASHBOARD_COLUMNS, "rows": rows,
+        return {"columns": s["dashboard_columns"], "labels": ss.DASHBOARD_COLUMNS, "kinds": ss.SECURITY_KINDS,
+                "rows": rows,
                 "window": s["candle_window_min"], "cycle": scanner.cycle_info}
 
     @app.get("/api/ticker/{ticker}")
@@ -288,7 +299,7 @@ def create_app(ctx: AppContext) -> FastAPI:
         s = db.effective_settings(user["id"])
         w = int(s["candle_window_min"])
         snap = db.snapshot(ticker, w)
-        series = charts.ticker_series(db, ticker, w, max(1, min(days, 14)))
+        series = await _ticker_series(ticker, w, max(1, min(days, 31)))
         # Свои алерты (с отметкой пуша) + общий журнал там, где своего нет — без дублей
         alerts_rows = db.query(
             "SELECT * FROM alerts a WHERE a.ticker = ? AND (a.key_id = ? OR (a.key_id IS NULL AND NOT EXISTS ("
@@ -301,7 +312,34 @@ def create_app(ctx: AppContext) -> FastAPI:
                 "series": series, "charts": s["charts"], "chart_labels": ss.CHARTS,
                 "alerts": [al.alert_from_row(r) for r in alerts_rows], "analysis": last_detail,
                 "favorite": bool(db.query_one("SELECT 1 FROM favorites WHERE key_id = ? AND ticker = ?",
-                                              (user["id"], ticker)))}
+                                              (user["id"], ticker))),
+                "paper": _open_papers(user["id"]).get(ticker)}
+
+    def _open_papers(key_id: int) -> dict[str, dict[str, Any]]:
+        """Последняя открытая paper-позиция по каждому тикеру пользователя."""
+        out: dict[str, dict[str, Any]] = {}
+        for r in db.query("SELECT * FROM paper_trades WHERE key_id = ? AND status = 'open' ORDER BY id", (key_id,)):
+            out[r["ticker"]] = r
+        return out
+
+    async def _ticker_series(ticker: str, window: int, days: int) -> dict[str, Any]:
+        """14 дней / месяц: если локальных минуток за период нет (срок хранения
+        короче) — часовые свечи из ISS одним запросом на P0 (кэш ISS)."""
+        if days < charts.LONG_RANGE_DAYS or charts.local_covers(db, ticker, days):
+            return charts.ticker_series(db, ticker, window, days)
+        frm = (now_msk() - timedelta(days=days)).strftime("%Y-%m-%d")
+        try:
+            fut = ctx.scheduler.submit(P0, f"hourly {ticker}", lambda: scanner.iss.candles(ticker, 60, frm),
+                                       dedup_key=f"hourly:{ticker}:{frm}")
+            hourly = await asyncio.wait_for(fut, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Часовые свечи %s недоступны: %s", ticker, exc)
+            out = charts.ticker_series(db, ticker, window, days)
+            out["note"] = f"ISS недоступен ({exc}); показана локальная история"
+            return out
+        if not hourly:
+            return charts.ticker_series(db, ticker, window, days)
+        return charts.ticker_series(db, ticker, window, days, candles=hourly, source="iss_hourly")
 
     @app.get("/api/metrics/{metric}")
     async def api_metric(metric: str, hours: float = 24, user: dict = Depends(current_user)):
@@ -397,27 +435,59 @@ def create_app(ctx: AppContext) -> FastAPI:
     # =============================================================== алерты
     @app.get("/api/alerts")
     async def api_alerts(scope: str = "mine", ticker: Optional[str] = None, direction: Optional[str] = None,
-                         day: Optional[str] = None, limit: int = 200, user: dict = Depends(current_user)):
+                         day: Optional[str] = None, limit: int = 200, fav: bool = False, kind: Optional[str] = None,
+                         action: Optional[str] = None, sort: str = "time", triggered: bool = False,
+                         user: dict = Depends(current_user)):
         """История сигналов (п. 9). ``scope=mine`` — алерты по моим порогам
-        (с отметкой отправлен/подавлен), ``scope=all`` — общий журнал сканера."""
+        (с отметкой отправлен/подавлен), ``scope=all`` — общий журнал сканера.
+
+        Фильтры issue #3: ``fav`` — только избранное, ``kind`` — тип бумаги
+        (share/fund/receipt/bond), ``action`` — действие, ``triggered`` — только
+        прошедшие анти-спам (без подавленных); сортировка ``sort``: time,
+        price_asc, price_desc, value_desc (оборот дня)."""
         where, params = [], []
         if scope == "all":
-            where.append("key_id IS NULL")
+            where.append("a.key_id IS NULL")
         else:
-            where.append("key_id = ?")
+            where.append("a.key_id = ?")
             params.append(user["id"])
         if ticker:
-            where.append("ticker = ?")
+            where.append("a.ticker = ?")
             params.append(ticker.upper())
         if direction:
-            where.append("direction = ?")
+            where.append("a.direction = ?")
             params.append(direction)
+        if action:
+            where.append("a.action = ?")
+            params.append(action)
         if day:
-            where.append("substr(ts,1,10) = ?")
+            where.append("substr(a.ts,1,10) = ?")
             params.append(day)
-        rows = db.query(f"SELECT * FROM alerts WHERE {' AND '.join(where)} ORDER BY ts DESC, id DESC LIMIT ?",
-                        (*params, max(1, min(limit, 1000))))
-        return {"alerts": [al.alert_from_row(r) for r in rows], "directions": ss.ALERT_DIRECTIONS}
+        if fav:
+            where.append("a.ticker IN (SELECT ticker FROM favorites WHERE key_id = ?)")
+            params.append(user["id"])
+        if triggered:
+            where.append("a.suppressed IS NULL")
+        if kind:
+            where.append("COALESCE(s.sectype, 'share') = ?")
+            params.append(kind)
+        order = {"price_asc": "a.price IS NULL, a.price ASC", "price_desc": "a.price IS NULL, a.price DESC",
+                 "value_desc": "s.value_today IS NULL, s.value_today DESC"}.get(sort, "a.ts DESC")
+        rows = db.query(
+            f"SELECT a.*, s.value_today AS value_today, s.last AS current_price, s.sectype AS sectype, "
+            f"s.name AS name FROM alerts a LEFT JOIN securities s ON s.ticker = a.ticker "
+            f"WHERE {' AND '.join(where)} ORDER BY {order}, a.ts DESC, a.id DESC LIMIT ?",
+            (*params, max(1, min(limit, 1000))))
+        out = []
+        for r in rows:
+            d = al.alert_from_row(r)
+            sec = scanner.securities.get(r["ticker"]) or {}
+            d["value_today"] = sec.get("value_today", r.get("value_today"))
+            d["current_price"] = sec.get("last", r.get("current_price"))
+            d["sectype"] = sec.get("sectype") or r.get("sectype") or "share"
+            out.append(d)
+        return {"alerts": out, "directions": ss.ALERT_DIRECTIONS, "actions": ss.ALERT_ACTIONS,
+                "kinds": ss.SECURITY_KINDS}
 
     # ======================================================= журнал решений
     @app.get("/api/decisions")
@@ -480,24 +550,45 @@ def create_app(ctx: AppContext) -> FastAPI:
         return rep
 
     # ======================================================= paper trading
+    def _paper_row(r: dict[str, Any]) -> dict[str, Any]:
+        sec = scanner.securities.get(r["ticker"]) or {}
+        r["lot"] = sec.get("lot")
+        r["notified"] = json.loads(r.get("notified") or "{}")
+        if r["status"] == "open" and sec.get("last"):
+            pct, rub = scanner.paper_pnl(r, sec["last"])
+            r["current_price"] = sec["last"]
+            r["unrealized_pct"] = pct
+            r["unrealized_rub"] = rub
+        return r
+
     @app.get("/api/paper")
     async def api_paper(user: dict = Depends(current_user)):
-        rows = db.query("SELECT * FROM paper_trades WHERE key_id = ? ORDER BY id DESC LIMIT 300", (user["id"],))
-        for r in rows:
-            sec = scanner.securities.get(r["ticker"]) or {}
-            if r["status"] == "open" and sec.get("last"):
-                sign = 1 if r["side"] == "long" else -1
-                r["current_price"] = sec["last"]
-                r["unrealized_pct"] = round((sec["last"] - r["entry_price"]) / r["entry_price"] * 100 * sign, 3)
+        rows = [_paper_row(r) for r in db.query("SELECT * FROM paper_trades WHERE key_id = ? ORDER BY id DESC LIMIT 300",
+                                                (user["id"],))]
         closed = [r for r in rows if r["status"] != "open" and r.get("result_pct") is not None]
         stats = {"open": sum(1 for r in rows if r["status"] == "open"), "closed": len(closed),
                  "wins": sum(1 for r in closed if r["result_pct"] > 0),
-                 "total_pct": round(sum(r["result_pct"] for r in closed), 3)}
+                 "total_pct": round(sum(r["result_pct"] for r in closed), 3),
+                 "total_rub": round(sum(r.get("profit_rub") or 0 for r in closed), 2),
+                 "open_rub": round(sum(r.get("unrealized_rub") or 0 for r in rows if r["status"] == "open"), 2)}
         stats["winrate"] = round(stats["wins"] / len(closed) * 100, 1) if closed else None
-        return {"trades": rows, "stats": stats}
+        s = db.effective_settings(user["id"])
+        return {"trades": rows, "stats": stats,
+                "settings": {k: s.get(k) for k in ("paper_auto_close", "paper_notify_enabled", "paper_target_pct",
+                                                    "paper_target_rub")}}
 
-    @app.post("/api/paper")
-    async def api_paper_open(body: dict, user: dict = Depends(current_user)):
+    def _qty(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            q = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "Количество — число") from None
+        if q <= 0:
+            raise HTTPException(422, "Количество должно быть больше 0")
+        return q
+
+    def _open_paper(user: dict, body: dict) -> int:
         alert = None
         if body.get("alert_id"):
             row = db.query_one("SELECT * FROM alerts WHERE id = ?", (int(body["alert_id"]),))
@@ -512,6 +603,9 @@ def create_app(ctx: AppContext) -> FastAPI:
         entry = float(body.get("entry_price") or sec.get("last") or (alert or {}).get("price") or 0)
         if entry <= 0:
             raise HTTPException(422, "Нет цены входа")
+        qty = _qty(body.get("qty"))
+        if qty is None:
+            qty = float(sec.get("lot") or 1)  # по умолчанию — один лот
         extra = (alert or {}).get("extra") or {}
         stop = body.get("stop", extra.get("stop"))
         take = body.get("take", extra.get("take"))
@@ -522,11 +616,55 @@ def create_app(ctx: AppContext) -> FastAPI:
             stop = stop if stop is not None else entry * (1 - sign * s["stop_atr_mult"] * atr_pct / 100)
             take = take if take is not None else entry * (1 + sign * s["take_atr_mult"] * atr_pct / 100)
         cur = db.execute(
-            "INSERT INTO paper_trades (key_id, ticker, side, entry_price, stop, take, alert_id, note, opened_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO paper_trades (key_id, ticker, side, entry_price, stop, take, alert_id, note, opened_at, qty) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (user["id"], ticker, side, entry, float(stop), float(take), body.get("alert_id"),
-             str(body.get("note") or "")[:300], fmt_ts(now_msk())))
-        return {"id": cur.lastrowid, **(await api_paper(user))}
+             str(body.get("note") or "")[:300], fmt_ts(now_msk()), qty))
+        return int(cur.lastrowid)
+
+    @app.post("/api/paper")
+    async def api_paper_open(body: dict, user: dict = Depends(current_user)):
+        return {"id": _open_paper(user, body), **(await api_paper(user))}
+
+    @app.post("/api/paper/toggle")
+    async def api_paper_toggle(body: dict, user: dict = Depends(current_user)):
+        """Кнопка «Paper» в таблице и карточке тикера (issue #3): нет открытой
+        позиции — открыть по текущей цене, есть — отменить (удалить) её."""
+        ticker = str(body.get("ticker") or "").upper()
+        open_t = _open_papers(user["id"]).get(ticker)
+        if open_t:
+            db.execute("DELETE FROM paper_trades WHERE id = ? AND key_id = ?", (open_t["id"], user["id"]))
+            return {"ticker": ticker, "paper": None, "removed": open_t["id"]}
+        tid = _open_paper(user, {**body, "ticker": ticker})
+        return {"ticker": ticker, "paper": _paper_row(db.query_one("SELECT * FROM paper_trades WHERE id = ?", (tid,)))}
+
+    @app.patch("/api/paper/{trade_id}")
+    async def api_paper_edit(trade_id: int, body: dict, user: dict = Depends(current_user)):
+        """Количество / стоп / тейк / заметка по сделке (количество можно
+        задать и у закрытой — тогда пересчитывается профит в ₽)."""
+        t = db.query_one("SELECT * FROM paper_trades WHERE id = ? AND key_id = ?", (trade_id, user["id"]))
+        if not t:
+            raise HTTPException(404, "Сделка не найдена")
+        sets, params = [], []
+        if "qty" in body:
+            t["qty"] = _qty(body["qty"])
+            sets.append("qty = ?")
+            params.append(t["qty"])
+        for k in ("stop", "take"):
+            if k in body:
+                v = body[k]
+                sets.append(f"{k} = ?")
+                params.append(None if v in (None, "") else float(v))
+        if "note" in body:
+            sets.append("note = ?")
+            params.append(str(body["note"] or "")[:300])
+        if t["status"] != "open" and t.get("exit_price") is not None and "qty" in body:
+            _, rub = scanner.paper_pnl(t, t["exit_price"])
+            sets.append("profit_rub = ?")
+            params.append(rub)
+        if sets:
+            db.execute(f"UPDATE paper_trades SET {', '.join(sets)} WHERE id = ?", (*params, trade_id))
+        return await api_paper(user)
 
     @app.post("/api/paper/{trade_id}/close")
     async def api_paper_close(trade_id: int, body: dict | None = None, user: dict = Depends(current_user)):
@@ -536,10 +674,9 @@ def create_app(ctx: AppContext) -> FastAPI:
         price = float((body or {}).get("price") or (scanner.securities.get(t["ticker"]) or {}).get("last") or 0)
         if price <= 0:
             raise HTTPException(422, "Нет цены выхода")
-        sign = 1 if t["side"] == "long" else -1
-        pct = (price - t["entry_price"]) / t["entry_price"] * 100 * sign
-        db.execute("UPDATE paper_trades SET status = 'manual', exit_price = ?, closed_at = ?, result_pct = ? "
-                   "WHERE id = ?", (price, fmt_ts(now_msk()), round(pct, 3), trade_id))
+        pct, rub = scanner.paper_pnl(t, price)
+        db.execute("UPDATE paper_trades SET status = 'manual', exit_price = ?, closed_at = ?, result_pct = ?, "
+                   "profit_rub = ? WHERE id = ?", (price, fmt_ts(now_msk()), pct, rub, trade_id))
         return await api_paper(user)
 
     @app.delete("/api/paper/{trade_id}")
