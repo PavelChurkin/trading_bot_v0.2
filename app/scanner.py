@@ -71,7 +71,11 @@ class Scanner:
         self.iss = iss
         self.scheduler = scheduler
         self.push = push
-        self.securities: dict[str, dict[str, Any]] = {r["ticker"]: r for r in db.query("SELECT * FROM securities")}
+        # Доска из БД: после рестарта ночью (биржа закрыта, цикла нет до 07:00)
+        # таблица не должна быть пустой — восстанавливаем флаг активности, как в apply_board.
+        self.securities: dict[str, dict[str, Any]] = {
+            r["ticker"]: {**r, "active": bool(r.get("prev_price") and r["prev_price"] > 0)}
+            for r in db.query("SELECT * FROM securities")}
         self.index: Optional[dict[str, Any]] = db.get_state("index")
         self.cycle_id: int = int(db.get_state("cycle_id", 0) or 0)
         self.cycle_running = False

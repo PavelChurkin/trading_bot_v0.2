@@ -459,3 +459,13 @@ def test_actions_column_default_and_migration(tmp_path):
     assert json.loads(d.query_one("SELECT value FROM settings WHERE scope = 'user:5' AND key = 'dashboard_columns'")[
         "value"]) == ["ticker"]
     d.close()
+
+
+def test_board_restored_from_db_after_restart(db):
+    """Рестарт ночью (цикла нет до 07:00): доска из БД остаётся активной,
+    иначе таблица «Рынок» показывает 0 бумаг."""
+    first, _ = make_scanner(db)
+    first.apply_board(run(first.iss.securities()), run(first.iss.marketdata()))
+    second, _ = make_scanner(db)
+    active = {t for t, s in second.securities.items() if s.get("active")}
+    assert active == {"PULS", "CALM"}  # DEAD без цены — неактивна
