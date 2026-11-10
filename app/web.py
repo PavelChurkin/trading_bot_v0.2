@@ -331,7 +331,8 @@ def create_app(ctx: AppContext) -> FastAPI:
         try:
             fut = ctx.scheduler.submit(P0, f"hourly {ticker}", lambda: scanner.iss.candles(ticker, 60, frm),
                                        dedup_key=f"hourly:{ticker}:{frm}")
-            hourly = await asyncio.wait_for(fut, timeout=30)
+            # shield: таймаут не отменяет общий (dedup) future — запрос дойдёт и закэшируется
+            hourly = await asyncio.wait_for(asyncio.shield(fut), timeout=30)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Часовые свечи %s недоступны: %s", ticker, exc)
             out = charts.ticker_series(db, ticker, window, days)

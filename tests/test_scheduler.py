@@ -58,6 +58,29 @@ def test_dedup_returns_same_future_and_bumps_priority():
     assert run(main()) == ["x", "y"]  # одна задача x, выполнена первой
 
 
+
+def test_dedup_after_waiter_timeout_requeues():
+    """Ожидающий отвалился по таймауту (wait_for отменил future) — повторный
+    submit с тем же dedup_key не должен вечно возвращать отменённый future."""
+    async def main():
+        sch = RequestScheduler(TokenBucket(1000, 1000))
+
+        async def f():
+            return "ok"
+
+        a = sch.submit(P0, "hourly", f, dedup_key="hourly:SBER")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(a, timeout=0.01)  # планировщик не запущен — таймаут
+        assert a.cancelled()
+        b = sch.submit(P0, "hourly", f, dedup_key="hourly:SBER")
+        assert b is not a and not b.done()
+        sch.start()
+        res = await asyncio.wait_for(b, timeout=2)
+        await sch.stop()
+        return res
+
+    assert run(main()) == "ok"
+
 def test_token_bucket_limits_rate():
     async def main():
         bucket = TokenBucket(rate=20, capacity=1)
