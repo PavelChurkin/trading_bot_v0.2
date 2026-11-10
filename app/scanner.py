@@ -134,7 +134,10 @@ class Scanner:
                         logger.exception("Цикл сканера упал")
                     wait = max(interval - (time.monotonic() - started), 5)
                 self.cycle_info["next_cycle_at"] = fmt_ts(now_msk() + timedelta(seconds=wait))
+                # Клик «Обновить сейчас» во время цикла уже обслужен этим циклом — не тащим
+                # флаг в следующую итерацию (иначе ночью прошёл бы лишний цикл)
                 self._wake.clear()
+                self._force_cycle = False
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=wait)
                 except asyncio.TimeoutError:
@@ -511,7 +514,7 @@ class Scanner:
         if done:
             return None
         alert.action = "your_enter" if self.is_favorite(key_id, alert.ticker) else "unique_enter"
-        what = "фиксации" if event["action"] == "avoid" else "распродажи"
+        what = {"avoid": "фиксации", "market": "рыночного шока"}.get(event["action"], "распродажи")
         alert.labels.append(f"после {what} {event['ts'][5:16]}")
         alert.extra["track"] = {"event_ts": event["ts"], "event_action": event["action"]}
         return alert.action

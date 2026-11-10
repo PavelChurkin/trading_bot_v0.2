@@ -58,12 +58,18 @@
     const list = (groups[name] = (groups[name] || []).filter((x) => x.isConnected));
     list.push(sc);
     sc.addEventListener("scroll", () => {
-      if (sc._syncing) { sc._syncing = false; return; }
+      if (sc._syncing) return;  // эхо программной прокрутки
       const ratio = sc.scrollLeft / Math.max(1, sc.scrollWidth - sc.clientWidth);
       for (const o of groups[name]) {
         if (o === sc || !o.isConnected) continue;
         const target = Math.round(ratio * Math.max(0, o.scrollWidth - o.clientWidth));
-        if (Math.abs(o.scrollLeft - target) > 1) { o._syncing = true; o.scrollLeft = target; }
+        if (Math.abs(o.scrollLeft - target) > 1) {
+          o._syncing = true;
+          o.scrollLeft = target;
+          // событие scroll приходит до rAF следующего кадра; если прокрутки не было
+          // (упёрлись в край) — флаг всё равно сбросится и не «съест» жест пользователя
+          requestAnimationFrame(() => { o._syncing = false; });
+        }
       }
     }, { passive: true });
   }

@@ -655,7 +655,10 @@ def create_app(ctx: AppContext) -> FastAPI:
             if k in body:
                 v = body[k]
                 sets.append(f"{k} = ?")
-                params.append(None if v in (None, "") else float(v))
+                try:
+                    params.append(None if v in (None, "") else float(v))
+                except (TypeError, ValueError):
+                    raise HTTPException(422, "Стоп/тейк — число") from None
         if "note" in body:
             sets.append("note = ?")
             params.append(str(body["note"] or "")[:300])

@@ -327,6 +327,7 @@ def test_paper_toggle_and_qty(env):
 
     tid = r["paper"]["id"]
     assert c.patch(f"/api/paper/{tid}", json={"qty": 0}).status_code == 422
+    assert c.patch(f"/api/paper/{tid}", json={"stop": "abc"}).status_code == 422
     p = c.patch(f"/api/paper/{tid}", json={"qty": 10}).json()
     tr = next(x for x in p["trades"] if x["id"] == tid)
     assert tr["qty"] == 10 and tr["unrealized_rub"] is not None
