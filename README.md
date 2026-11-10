@@ -354,6 +354,16 @@ pytest
 
 ![Рынок, реальные данные](docs/screenshots/12-live-market.png)
 
+Доработка 1 (issue #3), демо-сервер ночью — сканер на паузе (23:50–07:00 МСК):
+
+| | |
+|---|---|
+| ![Рынок: колонка «Действия», Paper включён (синяя подсветка)](docs/screenshots/13-market-paper-toggle.png) | ![Карточка: Paper рядом с ценой](docs/screenshots/14-ticker-paper-toggle.png) |
+| ![Сигналы: фильтры, сортировка, цена и оборот](docs/screenshots/16-signals-filters.png) | ![Paper: кол-во и профит в ₽](docs/screenshots/17-paper-qty-rub.png) |
+| ![Настройки: памп-фильтр и поиск пампов](docs/screenshots/18-settings-pump.png) | ![Настройки: 4 признака плиты](docs/screenshots/18-settings-plate.png) |
+| ![Настройки: пуши по действиям и цене](docs/screenshots/19-settings-push-filters.png) | ![Настройки: сопровождение и paper](docs/screenshots/20-settings-tracking-paper.png) |
+| ![Телефон: месячный график листается по горизонтали](docs/screenshots/15-month-chart-mobile.png) | ![Админ: очистка старше N дней](docs/screenshots/21-admin-purge.png) |
+
 ## Структура
 
 ```
