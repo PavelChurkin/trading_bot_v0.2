@@ -10,26 +10,19 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from .analysis import overheat
-from .settings_schema import ALERT_DIRECTIONS
+from .settings_schema import ALERT_ACTIONS, ALERT_DIRECTIONS
 
-ARROWS = {"up_pulse": "▲", "down_pulse": "▼", "up_plate": "⏫", "down_plate": "⏬", "sector_dump": "⚠"}
+ARROWS = {"up_pulse": "▲", "down_pulse": "▼", "up_plate": "⏫", "down_plate": "⏬", "pump": "🚀",
+          "sector_dump": "⚠"}
 
-ACTION_LABELS = {
-    "enter": "Кандидат на вход",
-    "late": "Поздно, ждать откат",
-    "filtered": "Памп-фильтр: вход не рекомендуется",
-    "avoid": "Не входить / фиксировать",
-    "rebound": "Кандидат на откуп/усреднение",
-    "selloff": "Распродажа — наблюдать",
-    "market": "Отраслевой/рыночный шок — не плита в отдельной бумаге",
-}
+ACTION_LABELS = ALERT_ACTIONS
 
 
 @dataclass
 class Alert:
     ticker: str
     ts: str
-    direction: str  # up_pulse | down_pulse | up_plate | down_plate | sector_dump
+    direction: str  # up_pulse | down_pulse | up_plate | down_plate | pump | sector_dump
     score: int  # сила сигнала 0..100 (не вероятность)
     amplitude_atr: Optional[float]
     volume_ratio: Optional[float]
@@ -143,6 +136,7 @@ def evaluate(snapshot: dict[str, Any], s: dict[str, Any], intraday: Optional[dic
     vol = snapshot.get("volume_ratio") or 0.0
     lb = int(snapshot.get("level_break") or 0)
     plate = snapshot.get("plate") or {}
+    plate_need = int(plate.get("need") or min(int(s.get("plate_min_score", 3)), 4))
     amp_max = s.get("amplitude_atr_max") or 0
     amp_ok = amp >= s["amplitude_atr_min"] and (amp_max <= 0 or amp <= amp_max)
     vol_ok = vol >= s["volume_mult"]
@@ -154,20 +148,31 @@ def evaluate(snapshot: dict[str, Any], s: dict[str, Any], intraday: Optional[dic
         {"cond": "level", "label": "Пробой уровня", "value": lb, "threshold": 1, "passed": lvl_ok,
          "ratio": round(level_closeness, 3), "shortfall": snapshot.get("level_distance_atr"),
          "note": "расстояние до уровня в ATR"},
-        {"cond": "plate", "label": "Плита (признаков из 4)", "value": plate.get("score", 0), "threshold": 3,
-         "passed": bool(plate.get("is_plate")), "ratio": round(plate.get("score", 0) / 3, 3),
-         "shortfall": None if plate.get("is_plate") else max(0, 3 - plate.get("score", 0)),
-         "note": "без коррекции — обязательный признак"},
+        {"cond": "plate", "label": f"Плита (признаков из {plate.get('enabled', 4)})", "value": plate.get("score", 0),
+         "threshold": plate_need, "passed": bool(plate.get("is_plate")),
+         "ratio": round(plate.get("score", 0) / plate_need, 3) if plate_need else 0.0,
+         "shortfall": None if plate.get("is_plate") else max(0, plate_need - plate.get("score", 0)),
+         "note": "без коррекции — обязательный признак" if s.get("plate_use_no_correction", True)
+         else "признак «без коррекции» отключён"},
     ]
+    # Поиск пампов (п. 20): рост за час > k×ATR — отдельный, независимый триггер
+    hour_atr = float(snapshot.get("change_hour_atr") or 0.0)
+    pump_k = float(s.get("pump_hour_atr_k") or 0)
+    pump_search = bool(s.get("pump_search_enabled"))
+    pump_hit = pump_search and pump_k > 0 and hour_atr >= pump_k
+    if pump_search:
+        checks.append(_check("pump", "Памп: рост за час/ATR", round(hour_atr, 3), pump_k, pump_hit))
     if amp_max and amp > amp_max:
         checks[0]["note"] = f"выше максимума {amp_max}"
     pulse = amp_ok and (vol_ok or lvl_ok)
     is_plate = bool(plate.get("is_plate"))
-    triggered = pulse or is_plate
+    triggered = pulse or is_plate or pump_hit
     amp_r = min(checks[0]["ratio"], 1.0) if not (amp_max and amp > amp_max) else 0.0
     pulse_closeness = min(amp_r if not amp_ok else 1.0, max(min(checks[1]["ratio"], 1.0), level_closeness))
-    plate_closeness = plate.get("score", 0) / 4 * (1.0 if plate.get("no_correction") else 0.5)
-    closeness = 1.0 if triggered else round(max(pulse_closeness, plate_closeness), 3)
+    plate_closeness = plate.get("score", 0) / max(plate.get("enabled", 4) or 4, 1) * (
+        1.0 if plate.get("no_correction") or not s.get("plate_use_no_correction", True) else 0.5)
+    pump_closeness = min(max(hour_atr / pump_k, 0.0), 1.0) if pump_search and pump_k else 0.0
+    closeness = 1.0 if triggered else round(max(pulse_closeness, plate_closeness, pump_closeness), 3)
     failed = [c["cond"] for c in checks if not c["passed"]]
     ev = Evaluation(snapshot["ticker"], triggered, closeness, checks, failed)
     if not triggered or intraday is None:
@@ -178,23 +183,32 @@ def evaluate(snapshot: dict[str, Any], s: dict[str, Any], intraday: Optional[dic
     if is_plate:
         direction = int(plate.get("direction") or direction)
         kind = "up_plate" if direction > 0 else "down_plate"
-    else:
+    elif pulse:
         kind = "up_pulse" if direction >= 0 else "down_pulse"
+    else:
+        kind = "pump"
     oh = overheat(snapshot, intraday, s)
     labels: list[str] = []
     if oh["label"]:
         labels.append(f"{oh['label']} ({oh['score']}/4)")
     if is_plate:
-        labels.append("плита уверенно (4/4)" if plate.get("confident") else "плита (3/4)")
+        n_on = plate.get("enabled", 4)
+        labels.append(f"плита уверенно ({plate.get('score', 0)}/{n_on})" if plate.get("confident")
+                      else f"плита ({plate.get('score', 0)}/{n_on})")
+    if pump_hit and kind != "pump":
+        labels.append(f"памп: +{hour_atr:.1f}×ATR за час")
     mute = False
     filters: list[str] = []
-    if kind == "up_pulse":
+    if kind == "pump":
+        action = "pump"
+    elif kind == "up_pulse":
         action = "enter"
-        x = s.get("pump_hour_pct_exclude") or 0
-        if x > 0 and (snapshot.get("change_hour_pct") or 0) > x:
-            filters.append(f"уже вырос на {snapshot['change_hour_pct']:.2f}% за час (> {x}%)")
-        if oh["mute_entry"]:
-            filters.append(f"памп-фильтр {oh['score']}/4")
+        if s.get("pump_filter_enabled", True):
+            x = s.get("pump_hour_pct_exclude") or 0
+            if x > 0 and (snapshot.get("change_hour_pct") or 0) > x:
+                filters.append(f"уже вырос на {snapshot['change_hour_pct']:.2f}% за час (> {x}%)")
+            if oh["mute_entry"]:
+                filters.append(f"памп-фильтр {oh['score']}/4")
         if filters:
             action, mute = "filtered", True
         elif (snapshot.get("impulse_age_min") or 0) > s["impulse_age_max_min"] or oh["score"] >= 2 or (
@@ -216,6 +230,10 @@ def evaluate(snapshot: dict[str, Any], s: dict[str, Any], intraday: Optional[dic
         "change_hour_pct": snapshot.get("change_hour_pct"), "impulse_move_pct": snapshot.get("impulse_move_pct"),
         "pullback_pct": snapshot.get("pullback_pct"), "plate": plate, "overheat": oh, "filters": filters,
         "intraday": intraday, "day_change_pct": snapshot.get("day_change_pct"),
+        "approach_speed_atr": snapshot.get("approach_speed_atr"),
+        "approach_intensity": snapshot.get("approach_intensity"),
+        "pump_peak_forecast": snapshot.get("pump_peak_forecast"),
+        "change_hour_atr": snapshot.get("change_hour_atr"),
     }
     if verdict:
         extra.update({"verdict": verdict.get("verdict"), "verdict_label": verdict.get("label"),
@@ -247,7 +265,14 @@ def build_reason(snapshot: dict[str, Any], kind: str, filters: list[str] | None 
         f"объём ×{snapshot.get('volume_ratio', 0):.1f} к среднему",
     ]
     plate = snapshot.get("plate") or {}
-    if kind in ("up_plate", "down_plate") and plate:
+    if kind == "pump":
+        parts = [f"рост за час {snapshot.get('change_hour_pct', 0):+.2f}% ({snapshot.get('change_hour_atr', 0):.1f}×ATR)",
+                 f"объём ×{snapshot.get('volume_ratio', 0):.1f} к среднему"]
+        if snapshot.get("approach_intensity"):
+            parts.append(f"интенсивность подхода {snapshot.get('approach_intensity'):.2f}")
+        if snapshot.get("pump_peak_forecast"):
+            parts.append(f"прогноз пика ≈{snapshot['pump_peak_forecast']:g} (гипотеза)")
+    elif kind in ("up_plate", "down_plate") and plate:
         parts.append(f"ход {plate.get('move_pct', 0):+.2f}% за {plate.get('n', 0) * snapshot.get('window', 0)} мин "
                      f"({plate.get('move_atr', 0):.1f}×ATR)")
         parts.append(f"откатов {plate.get('pullback_pct', 0):.0f}%")

@@ -4,6 +4,10 @@
  *   свечи: рост #199e70 — полая свеча, падение #e66767 — залитая
  *   (CVD ΔE 6.5 между ними — поэтому форма полая/залитая обязательна).
  * Одна ось Y на график, легенда при ≥2 сериях, перекрестие + подсказка.
+ * Длинные ряды (14 дней / месяц, issue #3): opts.step — минимум пикселей на
+ * точку; если ряд не влезает в ширину, график листается по горизонтали
+ * (свайп на телефоне), стартует с правого края, графики одной группы
+ * (opts.group) листаются синхронно.
  */
 (function () {
   "use strict";
@@ -46,15 +50,52 @@
     return ts.slice(8, 10) + "." + ts.slice(5, 7) + " " + ts.slice(11, 16);
   }
 
+  const groups = {};
+
+  /** Синхронная прокрутка графиков одной группы (свечи + индикаторы). */
+  function joinGroup(name, sc) {
+    if (!name) return;
+    const list = (groups[name] = (groups[name] || []).filter((x) => x.isConnected));
+    list.push(sc);
+    sc.addEventListener("scroll", () => {
+      if (sc._syncing) return;  // эхо программной прокрутки
+      const ratio = sc.scrollLeft / Math.max(1, sc.scrollWidth - sc.clientWidth);
+      for (const o of groups[name]) {
+        if (o === sc || !o.isConnected) continue;
+        const target = Math.round(ratio * Math.max(0, o.scrollWidth - o.clientWidth));
+        if (Math.abs(o.scrollLeft - target) > 1) {
+          o._syncing = true;
+          o.scrollLeft = target;
+          // событие scroll приходит до rAF следующего кадра; если прокрутки не было
+          // (упёрлись в край) — флаг всё равно сбросится и не «съест» жест пользователя
+          requestAnimationFrame(() => { o._syncing = false; });
+        }
+      }
+    }, { passive: true });
+  }
+
   /** Каркас: svg, шкалы, сетка, ось времени, подсказка. */
   function frame(container, opts) {
     container.innerHTML = "";
     container.classList.add("chart");
-    const W = container.clientWidth || 640;
-    const H = opts.height || 140;
-    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img",
-      "aria-label": opts.title || "график" }, container);
     const n = opts.n;
+    const avail = container.clientWidth || 640;
+    const need = opts.step ? Math.ceil(n * opts.step + PAD.l + PAD.r) : 0;
+    const W = Math.max(avail, need);
+    const H = opts.height || 140;
+    let host = container, scroller = null;
+    if (W > avail) {
+      scroller = document.createElement("div");
+      scroller.className = "scroller";
+      container.appendChild(scroller);
+      host = scroller;
+    }
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img",
+      "aria-label": opts.title || "график" }, host);
+    if (scroller) {
+      scroller.scrollLeft = scroller.scrollWidth;  // свежие данные справа
+      joinGroup(opts.group, scroller);
+    }
     const pw = W - PAD.l - PAD.r, ph = H - PAD.t - PAD.b;
     const x = (i) => PAD.l + (n <= 1 ? pw / 2 : (i / (n - 1)) * pw);
     let lo = opts.min, hi = opts.max;
@@ -69,14 +110,14 @@
       tx.textContent = fmt(t);
     }
     el("line", { x1: PAD.l, x2: PAD.l + pw, y1: PAD.t + ph, y2: PAD.t + ph, stroke: C.axis }, g);
-    // подписи времени: ~5 штук
+    // подписи времени: одна на ~110 px
     const labels = opts.labels || [];
-    const every = Math.max(1, Math.ceil(n / 5));
+    const every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / 110))));
     for (let i = 0; i < n; i += every) {
       const tx = el("text", { x: x(i), y: H - 5, fill: C.muted, "font-size": 10, "text-anchor": "middle", class: "tick" }, g);
       tx.textContent = shortTs(labels[i]);
     }
-    return { svg, W, H, x, y, pw, ph, n, lo, hi };
+    return { svg, W, H, x, y, pw, ph, n, lo, hi, scroller };
   }
 
   function refLine(f, v, label) {
@@ -118,6 +159,7 @@
     const hit = el("rect", { x: PAD.l, y: 0, width: f.pw, height: f.H, fill: "transparent" }, f.svg);
     function move(ev) {
       const r = f.svg.getBoundingClientRect();
+      const cr = container.getBoundingClientRect();
       const px = ((ev.clientX - r.left) / r.width) * f.W;
       const i = Math.max(0, Math.min(f.n - 1, Math.round(((px - PAD.l) / f.pw) * (f.n - 1))));
       line.setAttribute("x1", f.x(i)); line.setAttribute("x2", f.x(i));
@@ -125,8 +167,10 @@
       tip.hidden = false;
       tip.innerHTML = `<b>${shortTs(labels[i])}</b>` + rows(i).map(([k, v, c]) =>
         `<div><i style="background:${c || "transparent"}"></i>${k}<span>${typeof v === "string" ? v : fmt(v)}</span></div>`).join("");
-      const left = (f.x(i) / f.W) * r.width;
-      tip.style.left = Math.min(left + 12, r.width - tip.offsetWidth - 4) + "px";
+      // координата точки относительно видимой части контейнера (с учётом прокрутки)
+      const left = r.left - cr.left + (f.x(i) / f.W) * r.width;
+      const room = cr.width - tip.offsetWidth - 4;
+      tip.style.left = Math.max(4, left + 12 > room ? left - tip.offsetWidth - 12 : left + 12) + "px";
     }
     hit.addEventListener("pointermove", move);
     hit.addEventListener("pointerleave", () => { tip.hidden = true; line.setAttribute("visibility", "hidden"); });
@@ -150,7 +194,8 @@
     const series = [candles.map((c) => c[2]), candles.map((c) => c[3])];
     if (bb) series.push(bb.upper, bb.lower);
     const [lo, hi] = range(series);
-    const f = frame(container, { n, min: lo, max: hi, labels, height: opts.height || 240, title: "Свечи" });
+    const f = frame(container, { n, min: lo, max: hi, labels, height: opts.height || 240, title: "Свечи",
+      step: opts.step, group: opts.group });
     // объём — нижние 22% поля, своя доля высоты (не вторая ось: подписей нет, только форма)
     const vmax = Math.max(...candles.map((c) => c[5] || 0)) || 1;
     const vh = f.ph * 0.22, base = PAD.t + f.ph;
@@ -204,7 +249,7 @@
     if (opts.min !== undefined) lo = Math.min(lo, opts.min);
     if (opts.max !== undefined) hi = Math.max(hi, opts.max);
     const f = frame(container, { n, min: lo, max: hi, labels, height: opts.height || 120, title: opts.title,
-      fixed: opts.fixed });
+      fixed: opts.fixed, step: opts.step, group: opts.group });
     for (const [v, label] of opts.refs || []) refLine(f, v, label);
     if (opts.bars) {
       const bw = Math.max(1, Math.min(8, (f.pw / n) * 0.7));

@@ -96,6 +96,7 @@ def make_scanner(db):
 def test_full_cycle(db):
     user = auth.create_user_key(db, "trader")
     db.save_settings(f"user:{user['id']}", {"quiet_from": "", "quiet_to": ""})
+    db.save_settings("global", {"warmup_enabled": False})  # прогрев проверяется в test_issue3.py
     scanner, sched = make_scanner(db)
     p0_calls: list[str] = []
     orig = scanner.p0_detail

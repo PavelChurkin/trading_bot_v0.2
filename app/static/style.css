@@ -219,3 +219,16 @@ ul.plain li, ol.plain li { font-size: 13px; }
   .grid.two { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+/* issue #3: горизонтальная прокрутка длинных графиков (14 дней / месяц) */
+.chart .scroller { overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain;
+  scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
+.chart .scroller svg { width: auto; max-width: none; }
+.scroll-hint { font-size: 11px; color: var(--muted); margin: 2px 0 6px; }
+
+/* Кнопка Paper (вкл/выкл): нажата — светится синим, повторное нажатие отжимает */
+.paper-btn { min-width: 74px; transition: box-shadow .2s, background .2s; }
+.paper-btn.on { background: #3987e526; border-color: var(--accent); color: #cfe0fb;
+  box-shadow: 0 0 0 1px var(--accent), 0 0 12px #3987e5aa; }
+.paper-btn.on:hover { box-shadow: 0 0 0 1px var(--accent), 0 0 18px #3987e5cc; }
+input.qty { width: 90px; text-align: right; padding: 4px 6px; }

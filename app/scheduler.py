@@ -146,6 +146,8 @@ class RequestScheduler:
                dedup_key: Optional[str] = None) -> asyncio.Future:
         """Ставит задачу в очередь. Повторная задача с тем же ``dedup_key``
         не дублируется — возвращается future уже стоящей в очереди."""
+        if dedup_key and dedup_key in self._pending and self._pending[dedup_key].future.done():
+            self._pending.pop(dedup_key)  # отменён ожидающим (таймаут) — ставим заново
         if dedup_key and dedup_key in self._pending:
             existing = self._pending[dedup_key]
             if priority < existing.priority:

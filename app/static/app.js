@@ -124,6 +124,8 @@
       $("#statusbar").innerHTML = [
         `<span><i class="dot ${st.cycle_running ? "busy" : c.status === "ok" ? "on" : ""}"></i>Цикл <b>#${esc(c.cycle_id || "—")}</b>
           ${st.cycle_running ? "идёт…" : c.finished_at ? "завершён " + time(c.finished_at) : ""}</span>`,
+        c.status === "closed" ? `<span class="tag warn" title="Сканирование на паузе (настройки админа «Сканер»)">пауза: ${esc(c.closed_reason || "биржа закрыта")}${c.reopen_at ? " · до " + esc(String(c.reopen_at).slice(5, 16)) : ""}</span>` : "",
+        c.warmup && c.status !== "closed" ? `<span class="tag" title="Первый цикл после запуска/перерыва: сигналы записаны, но пуши не отправлялись">прогрев: ${esc(c.warmup)}</span>` : "",
         c.next_cycle_at ? `<span>Следующий <b>${time(c.next_cycle_at)}</b></span>` : "",
         c.triggered !== undefined ? `<span>Триггеров <b>${c.triggered}</b> · алертов <b>${c.alerts}</b> · пушей <b>${c.pushed}</b></span>` : "",
         `<span>Бумаг <b>${st.tickers}</b></span>`,
@@ -238,6 +240,8 @@
         return `<td class="num"><span class="closeness ${w >= 100 ? "full" : ""}"><i style="width:${w}%"></i></span>${w}%</td>`;
       }
       case "updated": return `<td class="num muted">${time(v)}</td>`;
+      case "actions": return `<td>${paperBtn(r.ticker, r.paper)}</td>`;
+      case "approach_intensity": return `<td class="num" title="Интенсивность подхода к уровню (гипотеза прогноза пика пампа)">${v === null || v === undefined ? "—" : num(v, 2)}</td>`;
       case "pullback_pct": case "amplitude_pct": return `<td class="num">${v === null || v === undefined ? "—" : num(v, 2)}</td>`;
       default: return `<td class="num">${num(v)}</td>`;
     }
@@ -278,7 +282,7 @@
       drawTable();
     }));
     $$("#tbl tbody tr").forEach((tr) => tr.addEventListener("click", (e) => {
-      if (e.target.dataset.fav) return;
+      if (e.target.dataset.fav || e.target.closest("[data-paper-toggle]")) return;
       go("ticker/" + encodeURIComponent(tr.dataset.t));
     }));
     $$("#tbl [data-fav]").forEach((s) => s.addEventListener("click", async (e) => {
@@ -289,6 +293,37 @@
       const row = S.table.rows.find((r) => r.ticker === t);
       if (row) row.favorite = !on;
       drawTable();
+    }));
+    bindPaperToggles($("#tbl"), (t, paper) => {
+      const row = S.table.rows.find((r) => r.ticker === t);
+      if (row) row.paper = paper;
+    });
+  }
+
+  // ------------------------------------------- кнопка Paper (вкл/выкл)
+  // Нажата (светится синим) — по тикеру открыта paper-позиция и идёт
+  // сопровождение; повторное нажатие отменяет (удаляет) позицию.
+  function paperBtn(ticker, paper) {
+    const on = !!paper;
+    const tip = on ? `Paper открыта: ${num(paper.qty)} шт. по ${num(paper.entry_price)} — нажмите, чтобы отменить`
+      : "Открыть paper-позицию по текущей цене и сопровождать";
+    return `<button class="small paper-btn ${on ? "on" : ""}" data-paper-toggle="${esc(ticker)}" aria-pressed="${on}" title="${esc(tip)}">Paper${on ? " ✓" : ""}</button>`;
+  }
+  function bindPaperToggles(root, onChange) {
+    $$("[data-paper-toggle]", root).forEach((b) => b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      busy(b, async () => {
+        const t = b.dataset.paperToggle;
+        const r = await api("/api/paper/toggle", { method: "POST", body: { ticker: t } });
+        const tmp = document.createElement("div");
+        tmp.innerHTML = paperBtn(t, r.paper);
+        const nb = tmp.firstChild;
+        b.replaceWith(nb);
+        bindPaperToggles(nb.parentNode, onChange);
+        if (onChange) onChange(t, r.paper);
+        toast(r.paper ? `Paper ${t}: ${num(r.paper.qty)} шт. по ${num(r.paper.entry_price)} — сопровождение включено`
+          : `Paper ${t} отменена`);
+      });
     }));
   }
 
@@ -421,7 +456,8 @@
           <div class="row"><a href="#market" class="muted">← Рынок</a>
             <h2 style="margin:0"><span class="star ${r.favorite ? "on" : ""}" id="fav">★</span> ${esc(r.ticker)}</h2>
             <span class="muted">${esc(sec.full_name || sec.name || "")}</span></div>
-          <div class="row mono">${num(row.price)} ₽ · ${pct(row.day_change_pct)}
+          <div class="row mono" id="price-box">${num(row.price)} ₽ · ${pct(row.day_change_pct)}
+            ${paperBtn(r.ticker, r.paper)}
             <button id="p0" class="primary small">P0-анализ сейчас</button></div>
         </div>
         <div class="stats" style="margin-top:14px">
@@ -439,15 +475,18 @@
       <div class="card">
         <div class="row between"><h2>Графики · окно ${r.series.window} мин</h2>
           <div class="row small">История:
-            ${[1, 3, 7].map((d) => `<button class="small ${d === days ? "primary" : "ghost"}" data-days="${d}">${d} д</button>`).join("")}
+            ${[[1, "1 д"], [3, "3 д"], [7, "7 д"], [14, "14 д"], [30, "месяц"]].map(([d, l]) =>
+              `<button class="small ${d === days ? "primary" : "ghost"}" data-days="${d}">${l}</button>`).join("")}
           </div></div>
+        ${days >= 14 ? `<p class="scroll-hint">${r.series.window >= 60 ? "Часовые свечи" : "Свечи"}${r.series.source === "iss_hourly" ? " из ISS (локальная история короче периода)" : ""} · листайте график по горизонтали ←→${r.series.note ? " · " + esc(r.series.note) : ""}</p>` : ""}
         <div class="choices small" id="chart-pick">${Object.entries(r.chart_labels).map(([k, l]) =>
           `<label><input type="checkbox" value="${k}" ${r.charts.includes(k) ? "checked" : ""}> ${esc(l)}</label>`).join("")}</div>
         <div id="charts"></div>
       </div>
-      <div class="card"><h2>Сигналы по ${esc(r.ticker)}</h2>${alertsTable(r.alerts, false)}</div>`;
+      <div class="card"><h2>Сигналы по ${esc(r.ticker)}</h2>${alertsTable(r.alerts, false, true)}</div>`;
     drawCharts($("#charts"), r.series, r.charts, r.chart_labels);
     bindAnalysis(view);
+    bindPaperToggles($("#price-box"), (_, paper) => { r.paper = paper; });
     $("#p0").addEventListener("click", (e) => busy(e.currentTarget, async () => {
       const a = await api("/api/analyze", { method: "POST", body: { ticker: r.ticker } });
       $("#analysis").innerHTML = `<div class="card"><p class="muted small">P0-анализ · ${esc(a.ts || "")}</p>${analysisHtml(a)}</div>`;
@@ -486,6 +525,8 @@
 
   function drawCharts(box, s, chosen, labels) {
     box.innerHTML = "";
+    // ≥ 6 px на свечу: длинные периоды листаются, графики индикаторов — синхронно
+    const sc = { step: 6, group: "ticker" };
     const ts = s.candles.map((c) => c[0]);
     const I = s.indicators;
     const add = (key, fn) => {
@@ -496,50 +537,54 @@
       fn(wrap.querySelector(".chart"));
     };
     const bb = chosen.includes("bollinger") ? { upper: I.bb_upper, middle: I.bb_middle, lower: I.bb_lower } : null;
-    if (chosen.includes("price")) add("price", (el) => TB.candles(el, s.candles, { bb }));
-    else if (bb) add("bollinger", (el) => TB.candles(el, s.candles, { bb }));
-    add("atr", (el) => TB.lines(el, ts, [{ name: "ATR(14)", values: I.atr, color: C.s1 }], { height: 100 }));
+    if (chosen.includes("price")) add("price", (el) => TB.candles(el, s.candles, { bb, ...sc }));
+    else if (bb) add("bollinger", (el) => TB.candles(el, s.candles, { bb, ...sc }));
+    add("atr", (el) => TB.lines(el, ts, [{ name: "ATR(14)", values: I.atr, color: C.s1 }], { height: 100, ...sc }));
     add("rsi", (el) => TB.lines(el, ts, [{ name: "RSI(14)", values: I.rsi, color: C.s1 }],
-      { min: 0, max: 100, fixed: true, refs: [[70, "70"], [30, "30"]], height: 110 }));
+      { min: 0, max: 100, fixed: true, refs: [[70, "70"], [30, "30"]], height: 110, ...sc }));
     add("macd", (el) => TB.lines(el, ts, [{ name: "MACD", values: I.macd_line, color: C.s1 },
-      { name: "Сигнал", values: I.macd_signal, color: C.s2 }], { bars: { name: "Гистограмма", values: I.macd_hist }, refs: [[0, ""]], height: 120 }));
+      { name: "Сигнал", values: I.macd_signal, color: C.s2 }], { bars: { name: "Гистограмма", values: I.macd_hist }, refs: [[0, ""]], height: 120, ...sc }));
     add("stoch", (el) => TB.lines(el, ts, [{ name: "%K", values: I.stoch_k, color: C.s1 },
-      { name: "%D", values: I.stoch_d, color: C.s2 }], { min: 0, max: 100, fixed: true, refs: [[80, "80"], [20, "20"]], height: 110 }));
+      { name: "%D", values: I.stoch_d, color: C.s2 }], { min: 0, max: 100, fixed: true, refs: [[80, "80"], [20, "20"]], height: 110, ...sc }));
     const M = s.metrics || {};
     const st = S.settings.values;
     add("amplitude_atr", (el) => TB.points(el, M.amplitude_atr, "Амплитуда/ATR",
-      { refs: [[st.amplitude_atr_min, "порог " + st.amplitude_atr_min]], min: 0, empty: "Метрика появится после циклов сканера" }));
+      { refs: [[st.amplitude_atr_min, "порог " + st.amplitude_atr_min]], min: 0, step: 3, empty: "Метрика появится после циклов сканера" }));
     add("volume_ratio", (el) => TB.points(el, M.volume_ratio, "Объём / средний",
-      { refs: [[st.volume_mult, "порог " + st.volume_mult]], min: 0, empty: "Метрика появится после циклов сканера" }));
+      { refs: [[st.volume_mult, "порог " + st.volume_mult]], min: 0, step: 3, empty: "Метрика появится после циклов сканера" }));
     add("impulse_age", (el) => TB.points(el, M.impulse_age_min, "Возраст импульса, мин",
-      { refs: [[st.impulse_age_max_min, "поздно > " + st.impulse_age_max_min]], min: 0, empty: "Метрика появится после циклов сканера" }));
+      { refs: [[st.impulse_age_max_min, "поздно > " + st.impulse_age_max_min]], min: 0, step: 3, empty: "Метрика появится после циклов сканера" }));
     add("threshold_distance", (el) => TB.points(el, (M.threshold_closeness || []).map((p) => [p[0], p[1] * 100]),
-      "Близость к порогу, %", { refs: [[100, "порог"]], min: 0, empty: "Метрика появится после циклов сканера" }));
+      "Близость к порогу, %", { refs: [[100, "порог"]], min: 0, step: 3, empty: "Метрика появится после циклов сканера" }));
     if (!box.children.length) box.innerHTML = '<div class="empty">Графики не выбраны</div>';
   }
 
   // ============================================================= Сигналы
-  function alertsTable(alerts, withTicker) {
+  function alertsTable(alerts, withTicker, noPaper) {
     if (!alerts.length) return '<div class="empty">Сигналов нет</div>';
     return `<div class="table-wrap"><table><thead><tr><th>Время</th>${withTicker ? "<th>Тикер</th>" : ""}<th>Тип</th>
+      <th class="num" title="Цена в момент сигнала / текущая">Цена</th><th class="num">Оборот дня, ₽</th>
       <th class="num">Сила*</th><th class="num">Амп/ATR</th><th class="num">Объём/ср.</th><th class="num">Возраст, мин</th>
-      <th>Действие</th><th>Причина</th><th>Пуш</th><th></th></tr></thead><tbody>
+      <th>Действие</th><th>Причина</th><th>Пуш</th>${noPaper ? "" : "<th></th>"}</tr></thead><tbody>
       ${alerts.map((a) => `<tr><td class="mono small">${esc(String(a.ts).slice(5, 16))}</td>
-        ${withTicker ? `<td><a href="#ticker/${esc(a.ticker)}"><b>${esc(a.ticker)}</b></a></td>` : ""}
+        ${withTicker ? `<td><a href="#ticker/${esc(a.ticker)}"><b>${esc(a.ticker)}</b></a>${a.sectype && a.sectype !== "share" && S.kinds ? ` <span class="tag">${esc(S.kinds[a.sectype] || a.sectype)}</span>` : ""}</td>` : ""}
         <td>${dirTag(a.direction, a.arrow + " " + a.direction_label)}</td>
+        <td class="num">${num(a.price)}${a.current_price && a.price && Math.abs(a.current_price - a.price) > 1e-9 ? `<br><span class="muted small" title="текущая">${num(a.current_price)}</span>` : ""}</td>
+        <td class="num">${compact(a.value_today)}</td>
         <td class="num">${a.score ?? "—"}</td><td class="num">${num(a.amplitude_atr, 2)}</td>
         <td class="num">${a.volume_ratio ? "×" + num(a.volume_ratio, 2) : "—"}</td><td class="num">${num(a.impulse_age_min, 0)}</td>
         <td class="small">${esc(a.action_label || "")}${(a.labels || []).length ? `<br><span class="muted">${esc(a.labels.join(", "))}</span>` : ""}</td>
         <td class="small" style="white-space:normal;min-width:280px">${esc(a.reason)}</td>
         <td class="small">${a.key_id === null ? '<span class="muted">журнал</span>' : a.pushed ? '<span class="up">отправлен</span>'
           : a.suppressed ? `<span class="muted">${esc(a.suppressed)}</span>` : '<span class="muted">нет устройств</span>'}</td>
-        <td>${a.ticker !== "РЫНОК" ? `<button class="small ghost" data-paper-alert="${a.id}">paper</button>` : ""}</td></tr>`).join("")}
-      </tbody></table></div><p class="muted small">* сила сигнала 0–100 — нормированная сумма признаков, не вероятность.</p>`;
+        ${noPaper ? "" : `<td>${a.ticker !== "РЫНОК" ? `<button class="small ghost" data-paper-alert="${a.id}">paper</button>` : ""}</td>`}</tr>`).join("")}
+      </tbody></table></div><p class="muted small">* сила сигнала 0–100 — нормированная сумма признаков, не вероятность.
+      ${noPaper ? "Paper-позиция по бумаге — кнопка «Paper» рядом с ценой вверху карточки." : ""}</p>`;
   }
   function bindAlertPaper(root) {
     $$("[data-paper-alert]", root).forEach((b) => b.addEventListener("click", () => busy(b, async () => {
       await api("/api/paper", { method: "POST", body: { alert_id: +b.dataset.paperAlert } });
-      toast("Paper-сделка по сигналу открыта");
+      toast("Paper-сделка по сигналу открыта — сопровождение включено");
     })));
   }
 
@@ -548,24 +593,40 @@
       <div class="row">
         <select id="s-scope"><option value="mine">Мои (по моим порогам)</option><option value="all">Журнал сканера (глобальные пороги)</option></select>
         <select id="s-dir"><option value="">Все типы</option></select>
+        <select id="s-act"><option value="">Все действия</option></select>
+        <select id="s-kind"><option value="">Акции и фонды</option></select>
         <input id="s-t" placeholder="Тикер" style="width:100px">
         <input id="s-day" type="date">
+        <select id="s-sort"><option value="time">Сначала новые</option><option value="price_asc">Цена ↑</option>
+          <option value="price_desc">Цена ↓</option><option value="value_desc">Оборот дня ↓</option></select>
+        <label class="small muted"><input type="checkbox" id="s-fav"> только избранное</label>
+        <label class="small muted" title="Только сигналы, прошедшие ваши фильтры пушей (без подавленных)"><input type="checkbox" id="s-trig"> только прошедшие фильтры</label>
         <button id="s-go">Показать</button></div></div>
       <div id="s-list"><div class="empty">Загрузка…</div></div></div>`;
     const load = async () => {
-      const p = new URLSearchParams({ scope: $("#s-scope").value });
+      const p = new URLSearchParams({ scope: $("#s-scope").value, sort: $("#s-sort").value });
       if ($("#s-dir").value) p.set("direction", $("#s-dir").value);
+      if ($("#s-act").value) p.set("action", $("#s-act").value);
+      if ($("#s-kind").value) p.set("kind", $("#s-kind").value);
       if ($("#s-t").value.trim()) p.set("ticker", $("#s-t").value.trim());
       if ($("#s-day").value) p.set("day", $("#s-day").value);
+      if ($("#s-fav").checked) p.set("fav", "1");
+      if ($("#s-trig").checked) p.set("triggered", "1");
       const r = await api("/api/alerts?" + p);
+      S.kinds = r.kinds;
       if ($("#s-dir").options.length === 1) {
         $("#s-dir").innerHTML += Object.entries(r.directions).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("");
+        $("#s-act").innerHTML += Object.entries(r.actions).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("");
+        $("#s-kind").innerHTML = '<option value="">Все бумаги</option>' +
+          Object.entries(r.kinds).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("");
       }
-      $("#s-list").innerHTML = alertsTable(r.alerts, true);
+      $("#s-list").innerHTML = alertsTable(r.alerts, true) +
+        ($("#s-kind").value === "bond" && !r.alerts.length ? '<p class="muted small">Сканер смотрит режим TQBR (акции, фонды, расписки) — облигации торгуются в других режимах и сюда не попадают.</p>' : "");
       bindAlertPaper($("#s-list"));
     };
     $("#s-go").addEventListener("click", (e) => busy(e.currentTarget, load));
-    ["s-scope", "s-dir", "s-day"].forEach((id) => $("#" + id).addEventListener("change", load));
+    ["s-scope", "s-dir", "s-act", "s-kind", "s-day", "s-sort", "s-fav", "s-trig"].forEach((id) => $("#" + id).addEventListener("change", load));
+    $("#s-t").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
     await load();
   }
 
@@ -636,30 +697,50 @@
   async function paper() {
     const r = await api("/api/paper");
     const st = r.stats;
-    view.innerHTML = `<div class="card"><h2>Paper trading <span class="muted small">· виртуальные сделки по сигналам, закрытие по стопу/тейку в цикле сканера</span></h2>
+    const ps = r.settings || {};
+    const rub = (v) => (v === null || v === undefined ? '<span class="muted">—</span>'
+      : `<span class="${v > 0 ? "up" : v < 0 ? "down" : ""}">${v > 0 ? "+" : ""}${num(v, 2)} ₽</span>`);
+    view.innerHTML = `<div class="card"><h2>Paper trading <span class="muted small">· симуляция сделок: сопровождение, пуши на выход, профит в ₽</span></h2>
       <div class="stats">${stat("Открыто", st.open)}${stat("Закрыто", st.closed)}${stat("Прибыльных", st.wins)}
-        ${stat("Винрейт", st.winrate === null ? "—" : num(st.winrate, 1) + "%")}${stat("Сумма результатов", pct(st.total_pct))}</div>
+        ${stat("Винрейт", st.winrate === null ? "—" : num(st.winrate, 1) + "%")}${stat("Сумма результатов", pct(st.total_pct))}
+        ${stat("Профит закрытых", rub(st.total_rub))}${stat("Плавающий профит", rub(st.open_rub))}</div>
+      <p class="small muted">Авто-закрытие по стопу/тейку: <b>${ps.paper_auto_close ? "включено" : "выключено — закрываете вручную по пушам"}</b> ·
+        пуши сопровождения: <b>${ps.paper_notify_enabled ? "включены" : "выключены"}</b> · цель: <b>${num(ps.paper_target_pct)}%</b>${ps.paper_target_rub ? ` или <b>${num(ps.paper_target_rub)} ₽</b>` : ""}
+        · <a href="#settings">изменить</a>. Пуши сопровождения не учитывают дневной лимит.</p>
       <div class="row"><input id="pp-t" placeholder="Тикер" style="width:110px"><select id="pp-side"><option value="long">long</option><option value="short">short</option></select>
+        <input id="pp-q" type="number" min="0" step="any" placeholder="Кол-во, шт (пусто — 1 лот)" style="width:190px">
         <input id="pp-e" placeholder="Цена входа (пусто — текущая)" style="width:200px"><input id="pp-s" placeholder="Стоп (пусто — от ATR)" style="width:170px">
         <input id="pp-k" placeholder="Тейк (пусто — от ATR)" style="width:170px"><button id="pp-go" class="primary">Открыть</button></div></div>
-      <div class="card">${r.trades.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>Тикер</th><th>Сторона</th><th class="num">Вход</th>
-        <th class="num">Стоп</th><th class="num">Тейк</th><th class="num">Текущая/выход</th><th class="num">Результат</th><th>Статус</th><th>Открыта</th><th></th></tr></thead><tbody>
+      <div class="card">${r.trades.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>Тикер</th><th>Сторона</th><th class="num">Кол-во, шт</th><th class="num">Вход</th>
+        <th class="num">Стоп</th><th class="num">Тейк</th><th class="num">Текущая/выход</th><th class="num">Результат</th><th class="num">Профит, ₽</th><th>Статус</th><th>Открыта</th><th></th></tr></thead><tbody>
         ${r.trades.map((t) => `<tr><td class="muted">${t.id}</td><td><a href="#ticker/${esc(t.ticker)}"><b>${esc(t.ticker)}</b></a></td><td>${esc(t.side)}</td>
+          <td class="num"><input class="qty" type="number" min="0" step="any" data-qty="${t.id}" value="${t.qty ?? ""}" placeholder="—" title="Количество акций${t.lot ? " (лот " + t.lot + ")" : ""}"></td>
           <td class="num">${num(t.entry_price)}</td><td class="num">${num(t.stop)}</td><td class="num">${num(t.take)}</td>
           <td class="num">${num(t.status === "open" ? t.current_price : t.exit_price)}</td>
           <td class="num">${pct(t.status === "open" ? t.unrealized_pct : t.result_pct)}</td>
-          <td>${t.status === "open" ? '<span class="tag accent">открыта</span>' : `<span class="tag">${esc({ stop: "стоп", take: "тейк", manual: "вручную" }[t.status] || t.status)}</span>`}</td>
+          <td class="num">${rub(t.status === "open" ? t.unrealized_rub : t.profit_rub)}</td>
+          <td>${t.status === "open" ? '<span class="tag accent">открыта</span>' : `<span class="tag">${esc({ stop: "стоп", take: "тейк", manual: "вручную" }[t.status] || t.status)}</span>`}
+            ${Object.keys(t.notified || {}).length ? `<span class="muted small" title="${esc(Object.keys(t.notified).join(", "))}">🔔${Object.keys(t.notified).length}</span>` : ""}</td>
           <td class="small mono">${esc(String(t.opened_at).slice(5, 16))}</td>
           <td>${t.status === "open" ? `<button class="small" data-close="${t.id}">Закрыть</button>` : ""}
-            <button class="small ghost" data-del="${t.id}">✕</button></td></tr>`).join("")}</tbody></table></div>`
-        : '<div class="empty">Сделок нет. Откройте по сигналу (кнопка «paper» в истории) или вручную.</div>'}</div>`;
+            <button class="small ghost" data-del="${t.id}">✕</button></td></tr>`).join("")}</tbody></table></div>
+          <p class="muted small">Количество можно дописать в любой момент (и у закрытых сделок) — профит в ₽ пересчитается.</p>`
+        : '<div class="empty">Сделок нет. Откройте кнопкой «Paper» в таблице «Рынок» / карточке акции, по сигналу или вручную.</div>'}</div>`;
     $("#pp-go").addEventListener("click", (e) => busy(e.currentTarget, async () => {
       const body = { ticker: $("#pp-t").value.trim(), side: $("#pp-side").value };
+      if ($("#pp-q").value) body.qty = +$("#pp-q").value.replace(",", ".");
       if ($("#pp-e").value) body.entry_price = +$("#pp-e").value.replace(",", ".");
       if ($("#pp-s").value) body.stop = +$("#pp-s").value.replace(",", ".");
       if ($("#pp-k").value) body.take = +$("#pp-k").value.replace(",", ".");
       await api("/api/paper", { method: "POST", body });
       paper();
+    }));
+    $$("[data-qty]").forEach((inp) => inp.addEventListener("change", async () => {
+      try {
+        await api(`/api/paper/${inp.dataset.qty}`, { method: "PATCH", body: { qty: inp.value === "" ? null : +inp.value.replace(",", ".") } });
+        toast("Количество сохранено");
+        paper();
+      } catch (e) { toast(e.message, true); }
     }));
     $$("[data-close]").forEach((b) => b.addEventListener("click", () => busy(b, async () => {
       await api(`/api/paper/${b.dataset.close}/close`, { method: "POST", body: {} }); paper();
@@ -881,6 +962,7 @@
         <div id="k-secret"></div><div id="k-list" style="margin-top:12px"></div></div>
       <div class="card"><h2>Управление</h2>
         <div class="row"><button id="a-scan" class="primary">Запустить цикл сканера сейчас</button>
+          <button id="a-purge" title="Удалить данные старше срока хранения (настройка «Хранить историю, дней»)">Очистить старше ${esc(st.global.retention_days)} дн.</button>
           <button id="a-stop" class="danger">Остановить сервер (как «0» в консоли)</button></div>
         <h3>Тестовый пуш</h3>
         <div class="row"><select id="a-target"><option value="">Себе</option><option value="all">Всем активным ключам</option>
@@ -919,6 +1001,11 @@
     }));
     $("#a-scan").addEventListener("click", (e) => busy(e.currentTarget, async () => {
       await api("/api/admin/scan-now", { method: "POST" }); toast("Цикл поставлен в очередь"); setTimeout(refreshStatus, 800);
+    }));
+    $("#a-purge").addEventListener("click", (e) => busy(e.currentTarget, async () => {
+      if (!confirm(`Удалить свечи, метрики, сигналы и журналы старше ${st.global.retention_days} дн.?`)) return;
+      const r = await api("/api/admin/purge", { method: "POST" });
+      toast("Удалено: " + Object.entries(r.deleted || {}).map(([k, v]) => `${k} ${v}`).join(", "));
     }));
     $("#a-stop").addEventListener("click", (e) => busy(e.currentTarget, async () => {
       if (!confirm("Остановить сервер и сканер?")) return;

@@ -30,19 +30,28 @@ from . import alerts as al
 from . import analysis as an
 from .auth import active_user_ids
 from .db import Database
-from .moex import IssClient, OrderbookUnavailable
+from .moex import IssClient, OrderbookUnavailable, security_kind
 from .push import PushService
 from .scheduler import P0, P1, P2, RequestScheduler
-from .timeutil import fmt_ts, in_quiet_hours, now_msk, parse_hhmm, parse_ts
+from .timeutil import (fmt_ts, in_quiet_hours, market_closed_reason, next_market_open, now_msk, parse_hhmm,
+                       parse_ts)
 
 logger = logging.getLogger(__name__)
 
 # Настройки, от которых зависит снапшот (наборы с одинаковыми значениями считаются один раз)
 SNAPSHOT_KEYS = ("candle_window_min", "volume_avg_window", "level_window", "plate_series_n", "plate_jerk_atr",
-                 "plate_pullback_max_pct", "plate_volume_mult", "plate_move_atr_k")
+                 "plate_pullback_max_pct", "plate_volume_mult", "plate_move_atr_k", "plate_use_series",
+                 "plate_use_no_correction", "plate_use_volume", "plate_use_move", "plate_min_score")
+# Моменты фиксации/распродажи, после которых сопровождение ждёт новый вход (issue #3)
+TRACK_EVENT_ACTIONS = ("avoid", "rebound", "selloff", "market")
+TRACK_ENTER_ACTIONS = ("unique_enter", "your_enter")
+# Сигналы, по которым шлём пуш по открытой paper-позиции
+PAPER_EXIT_ACTIONS = {"avoid": "фиксировать", "rebound": "кандидат на откуп", "selloff": "распродажа",
+                      "market": "рыночный шок"}
+WARMUP_REASON = "прогрев: первый цикл после запуска/перерыва"
 BLUE_CHIPS = ["SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "GMKN", "PLZL", "ALRS", "MGNT"]
 SNAPSHOT_METRICS = ("price", "amplitude_atr", "amplitude_pct", "volume_ratio", "atr", "change_hour_pct",
-                    "impulse_age_min", "plate_score", "level_distance_atr", "pullback_pct")
+                    "impulse_age_min", "plate_score", "level_distance_atr", "pullback_pct", "approach_intensity")
 P0_METRICS = ("rsi", "macd_line", "macd_signal", "macd_hist", "stoch_k", "stoch_d", "bb_upper", "bb_lower",
               "bb_middle")
 
@@ -62,7 +71,11 @@ class Scanner:
         self.iss = iss
         self.scheduler = scheduler
         self.push = push
-        self.securities: dict[str, dict[str, Any]] = {r["ticker"]: r for r in db.query("SELECT * FROM securities")}
+        # Доска из БД: после рестарта ночью (биржа закрыта, цикла нет до 07:00)
+        # таблица не должна быть пустой — восстанавливаем флаг активности, как в apply_board.
+        self.securities: dict[str, dict[str, Any]] = {
+            r["ticker"]: {**r, "active": bool(r.get("prev_price") and r["prev_price"] > 0)}
+            for r in db.query("SELECT * FROM securities")}
         self.index: Optional[dict[str, Any]] = db.get_state("index")
         self.cycle_id: int = int(db.get_state("cycle_id", 0) or 0)
         self.cycle_running = False
@@ -74,11 +87,21 @@ class Scanner:
         self._daily_atr_day: Optional[str] = None
         self._purge_day: Optional[str] = None
         self.started_at = now_msk()
+        self._force_cycle = False
 
     # ================================================================ запуск
     def request_cycle(self) -> None:
-        """Кнопка «Обновить сейчас» в админке: не ждать интервал."""
+        """Кнопка «Обновить сейчас» в админке: не ждать интервал (и часы торгов)."""
+        self._force_cycle = True
         self._wake.set()
+
+    def market_closed(self, now=None, g: Optional[dict[str, Any]] = None) -> Optional[str]:
+        """Причина пропуска цикла вне часов торгов (issue #3, п. 1) или ``None``."""
+        g = g or self.db.global_settings()
+        if not g.get("market_hours_only"):
+            return None
+        return market_closed_reason(now or now_msk(), g.get("market_open"), g.get("market_close"),
+                                    bool(g.get("skip_weekends")))
 
     def stop(self) -> None:
         self._stopping = True
@@ -89,16 +112,32 @@ class Scanner:
         try:
             while not self._stopping:
                 started = time.monotonic()
-                try:
-                    await self.run_cycle()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    logger.exception("Цикл сканера упал")
-                interval = max(int(self.db.global_settings()["scan_interval_min"]), 15) * 60
-                wait = max(interval - (time.monotonic() - started), 5)
+                g = self.db.global_settings()
+                interval = max(int(g["scan_interval_min"]), 15) * 60
+                closed = None if self._force_cycle else self.market_closed(g=g)
+                self._force_cycle = False
+                if closed:
+                    now = now_msk()
+                    reopen = next_market_open(now, g.get("market_open"), g.get("market_close"),
+                                              bool(g.get("skip_weekends")))
+                    wait = max(min(interval, (reopen - now).total_seconds()), 5)
+                    if self.cycle_info.get("status") != "closed":
+                        logger.info("Сканер спит: %s, до %s", closed, fmt_ts(reopen))
+                    self.cycle_info = {**self.db.get_state("last_cycle", {}), "status": "closed",
+                                       "closed_reason": closed, "reopen_at": fmt_ts(reopen)}
+                else:
+                    try:
+                        await self.run_cycle()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Цикл сканера упал")
+                    wait = max(interval - (time.monotonic() - started), 5)
                 self.cycle_info["next_cycle_at"] = fmt_ts(now_msk() + timedelta(seconds=wait))
+                # Клик «Обновить сейчас» во время цикла уже обслужен этим циклом — не тащим
+                # флаг в следующую итерацию (иначе ночью прошёл бы лишний цикл)
                 self._wake.clear()
+                self._force_cycle = False
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=wait)
                 except asyncio.TimeoutError:
@@ -123,6 +162,9 @@ class Scanner:
         cycle_started = now_msk()
         t0 = time.monotonic()
         info: dict[str, Any] = {"cycle_id": self.cycle_id, "started_at": fmt_ts(cycle_started), "status": "running"}
+        warmup = self.warmup_reason(cycle_started)
+        if warmup:
+            info["warmup"] = warmup
         self.cycle_info = info
         try:
             await self._refresh_board()
@@ -130,6 +172,7 @@ class Scanner:
             tickers = sorted(t for t, sec in self.securities.items() if sec.get("active"))
             info["tickers"] = len(tickers)
             ctx = CycleContext(self.cycle_id, sets)
+            ctx.warmup = bool(warmup)
             jobs = [self._process_ticker(t, ctx) for t in tickers]
             await asyncio.gather(*jobs, return_exceptions=False)
             await self._sector_dump(ctx)
@@ -141,6 +184,7 @@ class Scanner:
             })
             self.scheduler.p1_cycle = {k: info.get(k) for k in ("cycle_id", "started_at", "finished_at",
                                                                  "duration_sec", "tickers")}
+            self.db.set_state("last_scan_at", info["finished_at"])
             # P2: фон, не мешает P0/P1
             self._schedule_background(tickers)
         except Exception as exc:  # noqa: BLE001
@@ -153,6 +197,25 @@ class Scanner:
                     info.get("tickers"), info.get("triggered"), info.get("alerts"), info.get("pushed"),
                     time.monotonic() - t0)
         return info
+
+    def warmup_reason(self, now=None) -> Optional[str]:
+        """Первый цикл после запуска или перерыва (ночь, выключенный сканер) —
+        «прогрев»: хвост свечей догружается за весь пропуск, и старые импульсы
+        выглядят как новые. Такие алерты сохраняются, но без пушей (issue #3, п. 2)."""
+        g = self.db.global_settings()
+        if not g.get("warmup_enabled"):
+            return None
+        last = self.db.get_state("last_scan_at")
+        if not last:
+            return "первый запуск"
+        gap = max(int(g.get("warmup_gap_min") or 45), 2 * max(int(g.get("scan_interval_min") or 15), 15))
+        try:
+            idle = ((now or now_msk()) - parse_ts(last)).total_seconds() / 60
+        except ValueError:
+            return "первый запуск"
+        if idle > gap:
+            return f"перерыв {idle:.0f} мин"
+        return None
 
     async def _refresh_board(self) -> None:
         secs_f = self.scheduler.submit(P1, "securities", self.iss.securities, dedup_key="securities")
@@ -183,7 +246,7 @@ class Scanner:
                 "ticker": t, "name": sec.get("SHORTNAME"), "full_name": sec.get("SECNAME"), "lot": sec.get("LOTSIZE"),
                 "prev_price": prev, "last": last, "open": m.get("OPEN"), "high": m.get("HIGH"), "low": m.get("LOW"),
                 "volume_today": m.get("VOLTODAY"), "value_today": m.get("VALTODAY"), "day_change_pct": change,
-                "updated_at": now,
+                "updated_at": now, "sectype": security_kind(sec.get("SECTYPE"), sec.get("SECNAME")),
             }
             rows.append(row)
             old = self.securities.get(t, {})
@@ -193,12 +256,13 @@ class Scanner:
         with self.db.transaction() as conn:
             conn.executemany(
                 "INSERT INTO securities (ticker, name, full_name, lot, prev_price, last, open, high, low, volume_today, "
-                "value_today, day_change_pct, updated_at) VALUES (:ticker,:name,:full_name,:lot,:prev_price,:last,"
-                ":open,:high,:low,:volume_today,:value_today,:day_change_pct,:updated_at) ON CONFLICT(ticker) DO UPDATE "
+                "value_today, day_change_pct, updated_at, sectype) VALUES (:ticker,:name,:full_name,:lot,:prev_price,"
+                ":last,:open,:high,:low,:volume_today,:value_today,:day_change_pct,:updated_at,:sectype) "
+                "ON CONFLICT(ticker) DO UPDATE "
                 "SET name=excluded.name, full_name=excluded.full_name, lot=excluded.lot, prev_price=excluded.prev_price, "
                 "last=excluded.last, open=excluded.open, high=excluded.high, low=excluded.low, "
                 "volume_today=excluded.volume_today, value_today=excluded.value_today, "
-                "day_change_pct=excluded.day_change_pct, updated_at=excluded.updated_at",
+                "day_change_pct=excluded.day_change_pct, updated_at=excluded.updated_at, sectype=excluded.sectype",
                 rows,
             )
 
@@ -405,7 +469,10 @@ class Scanner:
             (key_id, alert.ticker, alert.ts, alert.direction))
         if dup:
             return None
-        suppressed = self.suppression_reason(key_id, s, alert)
+        warmup = ctx is not None and ctx.warmup
+        if key_id is not None and not warmup:
+            self.track_entry(key_id, s, alert)
+        suppressed = WARMUP_REASON if warmup else self.suppression_reason(key_id, s, alert)
         pushed = False
         if key_id is not None and suppressed is None:
             msg = al.format_push(alert, s)
@@ -418,7 +485,39 @@ class Scanner:
         if ctx is not None:
             ctx.alerts += 1
             ctx.pushed += int(pushed)
+        if key_id is not None and not warmup and alert.action in PAPER_EXIT_ACTIONS:
+            await self.paper_alert_notify(key_id, s, alert)
         return int(cur.lastrowid)
+
+    def is_favorite(self, key_id: int, ticker: str) -> bool:
+        return self.db.query_one("SELECT 1 AS x FROM favorites WHERE key_id = ? AND ticker = ?",
+                                 (key_id, ticker)) is not None
+
+    def track_entry(self, key_id: int, s: dict[str, Any], alert: al.Alert, now=None) -> Optional[str]:
+        """Сопровождение (issue #3, п. 9): после фиксации (плита вверх) или
+        распродажи (импульс/плита вниз) первый «Кандидат на вход» по бумаге
+        становится «Уникальным кандидатом на вход», а для избранного — «Вашим
+        кандидатом на вход». Такие пуши не учитываются в дневном лимите."""
+        if alert.action != "enter" or not s.get("track_enabled", True):
+            return None
+        since = fmt_ts((now or now_msk()) - timedelta(days=int(s.get("track_window_days") or 5)))
+        marks = ",".join("?" * len(TRACK_EVENT_ACTIONS))
+        event = self.db.query_one(
+            f"SELECT ts, action FROM alerts WHERE (key_id = ? OR key_id IS NULL) AND ticker = ? AND action IN ({marks}) "
+            "AND ts >= ? AND ts < ? ORDER BY ts DESC LIMIT 1",
+            (key_id, alert.ticker, *TRACK_EVENT_ACTIONS, since, alert.ts))
+        if not event:
+            return None
+        done = self.db.query_one(
+            "SELECT id FROM alerts WHERE key_id = ? AND ticker = ? AND action IN (?, ?) AND suppressed IS NULL "
+            "AND ts > ? LIMIT 1", (key_id, alert.ticker, *TRACK_ENTER_ACTIONS, event["ts"]))
+        if done:
+            return None
+        alert.action = "your_enter" if self.is_favorite(key_id, alert.ticker) else "unique_enter"
+        what = {"avoid": "фиксации", "market": "рыночного шока"}.get(event["action"], "распродажи")
+        alert.labels.append(f"после {what} {event['ts'][5:16]}")
+        alert.extra["track"] = {"event_ts": event["ts"], "event_action": event["action"]}
+        return alert.action
 
     def suppression_reason(self, key_id: Optional[int], s: dict[str, Any], alert: al.Alert,
                            now=None) -> Optional[str]:
@@ -427,8 +526,16 @@ class Scanner:
             return "тип отключён"
         if alert.mute_push:
             return "памп-фильтр"
+        actions = s.get("push_actions")
+        if actions is not None and alert.action not in actions:
+            return "действие отключено"
+        price = alert.price
+        pmin, pmax = float(s.get("push_price_min") or 0), float(s.get("push_price_max") or 0)
+        if price is not None and ((pmin > 0 and price < pmin) or (pmax > 0 and price > pmax)):
+            return "цена вне диапазона"
+        tracking = alert.action in TRACK_ENTER_ACTIONS
         cd = int(s.get("cooldown_min") or 0)
-        if cd > 0:
+        if cd > 0 and not tracking:
             since = fmt_ts(now - timedelta(minutes=cd))
             recent = self.db.query_one(
                 "SELECT id FROM alerts WHERE key_id IS ? AND ticker = ? AND suppressed IS NULL AND ts >= ? LIMIT 1",
@@ -436,11 +543,11 @@ class Scanner:
             if recent:
                 return f"кулдаун {cd} мин"
         limit = int(s.get("daily_push_limit") or 0)
-        if key_id is not None and limit > 0:
+        if key_id is not None and limit > 0 and not tracking:
             day = now.strftime("%Y-%m-%d")
             n = self.db.query_one(
-                "SELECT COUNT(*) AS n FROM alerts WHERE key_id = ? AND suppressed IS NULL AND substr(ts,1,10) = ?",
-                (key_id, day))["n"]
+                "SELECT COUNT(*) AS n FROM alerts WHERE key_id = ? AND suppressed IS NULL AND substr(ts,1,10) = ? "
+                "AND COALESCE(action, '') NOT IN (?, ?)", (key_id, day, *TRACK_ENTER_ACTIONS))["n"]
             if n >= limit:
                 return f"лимит {limit} в день"
         if key_id is not None and in_quiet_hours(now, s.get("quiet_from"), s.get("quiet_to")):
@@ -476,9 +583,91 @@ class Scanner:
 
     # ---------------------------------------------------------- paper trading
     async def _update_paper_trades(self) -> None:
-        """Paper trading (п. 26): закрываем виртуальные сделки по стопу/тейку по минуткам."""
+        """Paper trading (п. 26 + issue #3): стоп/тейк по минуткам (если включено
+        авто-закрытие) и пуши сопровождения: цель в % и в ₽, закрытие."""
+        settings: dict[int, dict[str, Any]] = {}
         for t in self.db.query("SELECT * FROM paper_trades WHERE status = 'open'"):
-            self.check_paper_trade(t)
+            kid = t["key_id"]
+            if kid not in settings:
+                settings[kid] = self.db.effective_settings(kid)
+            s = settings[kid]
+            closed = self.check_paper_trade(t) if s.get("paper_auto_close", True) else None
+            if closed:
+                sign = "+" if closed["result_pct"] >= 0 else ""
+                await self.paper_notify(t, s, "closed",
+                                        f"Paper {t['ticker']}: закрыта по {'тейку' if closed['status'] == 'take' else 'стопу'}",
+                                        f"{sign}{closed['result_pct']:.2f}%" + _rub(closed.get("profit_rub")))
+                continue
+            await self.paper_targets(t, s)
+
+    def paper_price(self, ticker: str) -> Optional[float]:
+        sec = self.securities.get(ticker) or {}
+        price = sec.get("last")
+        if not price:
+            last = self.db.last_candles(ticker, 1)
+            price = last[-1]["close"] if last else None
+        return price
+
+    @staticmethod
+    def paper_pnl(t: dict[str, Any], price: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+        """(прибыль в %, прибыль в ₽) по цене ``price``; ₽ — если задано количество."""
+        if not price or not t.get("entry_price"):
+            return None, None
+        sign = 1 if t["side"] == "long" else -1
+        pct = (price - t["entry_price"]) / t["entry_price"] * 100 * sign
+        qty = t.get("qty")
+        rub = (price - t["entry_price"]) * qty * sign if qty else None
+        return round(pct, 3), (round(rub, 2) if rub is not None else None)
+
+    async def paper_targets(self, t: dict[str, Any], s: dict[str, Any]) -> list[str]:
+        """Пуш «пора выходить», когда прибыль достигла цели в % или в ₽ (один раз на цель)."""
+        pct, rub = self.paper_pnl(t, self.paper_price(t["ticker"]))
+        if pct is None:
+            return []
+        sent = []
+        target_pct = float(s.get("paper_target_pct") or 0)
+        target_rub = float(s.get("paper_target_rub") or 0)
+        if target_pct > 0 and pct >= target_pct:
+            if await self.paper_notify(t, s, "target_pct", f"Paper {t['ticker']}: +{pct:.2f}% — цель {target_pct:g}%",
+                                       "Прибыль достигла цели — пора выходить?" + _rub(rub)):
+                sent.append("target_pct")
+        if target_rub > 0 and rub is not None and rub >= target_rub:
+            if await self.paper_notify(t, s, "target_rub", f"Paper {t['ticker']}: +{rub:,.0f} ₽ — цель {target_rub:,.0f} ₽",
+                                       f"Прибыль {pct:+.2f}% достигла цели в рублях — пора выходить?"):
+                sent.append("target_rub")
+        return sent
+
+    async def paper_alert_notify(self, key_id: int, s: dict[str, Any], alert: al.Alert) -> int:
+        """Сопровождение paper (issue #3, п. 9): позиция отслеживается до сигнала
+        «кандидат на откуп» / «распродажа» (и «фиксировать») — тогда пуш."""
+        n = 0
+        for t in self.db.query("SELECT * FROM paper_trades WHERE key_id = ? AND ticker = ? AND status = 'open' "
+                               "AND opened_at <= ?", (key_id, alert.ticker, alert.ts)):
+            pct, rub = self.paper_pnl(t, alert.price or self.paper_price(t["ticker"]))
+            body = f"{alert.direction_label}: {alert.action_label}."
+            if pct is not None:
+                body += f" Позиция {pct:+.2f}%" + _rub(rub)
+            if await self.paper_notify(t, s, f"alert:{alert.ts}:{alert.action}",
+                                       f"Paper {t['ticker']}: {PAPER_EXIT_ACTIONS[alert.action]}", body):
+                n += 1
+        return n
+
+    async def paper_notify(self, t: dict[str, Any], s: dict[str, Any], key: str, title: str, body: str) -> bool:
+        """Один пуш на событие ``key`` по сделке. Не учитывается в дневном лимите,
+        тихие часы соблюдаются. Отметка — в ``paper_trades.notified``."""
+        if not s.get("paper_notify_enabled", True):
+            return False
+        notified = json.loads(t.get("notified") or "{}")
+        if key in notified:
+            return False
+        now = now_msk()
+        if in_quiet_hours(now, s.get("quiet_from"), s.get("quiet_to")):
+            return False
+        res = await self.push.send_to_key(t["key_id"], title, body, {"ticker": t["ticker"], "url": "/#paper"})
+        notified[key] = fmt_ts(now)
+        t["notified"] = json.dumps(notified, ensure_ascii=False)
+        self.db.execute("UPDATE paper_trades SET notified = ? WHERE id = ?", (t["notified"], t["id"]))
+        return bool(res.get("sent"))
 
     def check_paper_trade(self, t: dict[str, Any]) -> Optional[dict[str, Any]]:
         candles = self.db.candles_since(t["ticker"], t["opened_at"])
@@ -491,11 +680,11 @@ class Scanner:
                 hit = ("take", t["take"])
             if hit:
                 status, price = hit
-                pct = (price - t["entry_price"]) / t["entry_price"] * 100 * (1 if long else -1)
+                pct, rub = self.paper_pnl(t, price)
                 self.db.execute(
-                    "UPDATE paper_trades SET status = ?, exit_price = ?, closed_at = ?, result_pct = ? WHERE id = ?",
-                    (status, price, c["ts"], round(pct, 3), t["id"]))
-                return {"status": status, "exit_price": price, "result_pct": round(pct, 3)}
+                    "UPDATE paper_trades SET status = ?, exit_price = ?, closed_at = ?, result_pct = ?, profit_rub = ? "
+                    "WHERE id = ?", (status, price, c["ts"], pct, rub, t["id"]))
+                return {"status": status, "exit_price": price, "result_pct": pct, "profit_rub": rub}
         return None
 
     # ------------------------------------------------------------- фон (P2)
@@ -632,6 +821,7 @@ class CycleContext:
         self.pushed = 0
         self.errors = 0
         self.no_data = 0
+        self.warmup = False
         self.candidates: list[tuple[Optional[int], dict[str, Any], al.Alert]] = []
 
 
@@ -651,6 +841,10 @@ def format_report(report: dict[str, Any]) -> tuple[str, str]:
     title = f"Итоги дня {report['day']}"
     body = f"▲ Вверх: {line(top['up'])}\n▼ Вниз: {line(top['down'])}"
     return title, body
+
+
+def _rub(v: Optional[float]) -> str:
+    return f" ({v:+,.0f} ₽)".replace(",", " ") if v is not None else ""
 
 
 def _mover(sec: dict[str, Any]) -> dict[str, Any]:

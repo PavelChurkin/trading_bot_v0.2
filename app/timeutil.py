@@ -46,3 +46,31 @@ def in_quiet_hours(now: datetime, quiet_from: str | None, quiet_to: str | None) 
     if start < end:
         return start <= current < end
     return current >= start or current < end
+
+
+def market_closed_reason(now: datetime, open_at: str | None, close_at: str | None,
+                         skip_weekends: bool = False) -> str | None:
+    """Причина, по которой биржа сейчас закрыта (``None`` — торги идут).
+
+    Часы торгов [open_at, close_at) по Москве, по умолчанию 07:00–23:50.
+    """
+    now = now.astimezone(MSK)
+    if skip_weekends and now.weekday() >= 5:
+        return "выходной день"
+    start, end = parse_hhmm(open_at), parse_hhmm(close_at)
+    if start is None or end is None or start == end:
+        return None
+    if in_quiet_hours(now, close_at, open_at):
+        return f"биржа закрыта ({close_at}–{open_at} МСК)"
+    return None
+
+
+def next_market_open(now: datetime, open_at: str | None, close_at: str | None,
+                     skip_weekends: bool = False) -> datetime:
+    """Ближайший момент (с точностью до минуты), когда торги идут."""
+    t = now.astimezone(MSK).replace(second=0, microsecond=0)
+    for _ in range(8 * 24 * 60):
+        if market_closed_reason(t, open_at, close_at, skip_weekends) is None:
+            return t
+        t += timedelta(minutes=1)
+    return now

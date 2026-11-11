@@ -102,7 +102,7 @@ class IssClient:
         """Список акций режима TQBR (кэш — сутки)."""
         data = await self.get(SHARES + "/securities", {
             "iss.only": "securities",
-            "securities.columns": "SECID,SHORTNAME,SECNAME,PREVPRICE,PREVDATE,LOTSIZE",
+            "securities.columns": "SECID,SHORTNAME,SECNAME,PREVPRICE,PREVDATE,LOTSIZE,SECTYPE",
         }, cache_ttl=TTL_SECURITIES)
         return table(data, "securities")
 
@@ -179,3 +179,23 @@ class IssClient:
             if best_bid:
                 spread_pct = (best_ask - best_bid) / best_bid * 100
         return {"bids": bids, "asks": asks, "spread_pct": spread_pct}
+
+
+# SECTYPE из справочника ISS: 1/2 — акции обыкн./прив., D — депозитарные
+# расписки, 9/A/B/J — паи ПИФов, E — иностранные ETF, 3..8/C — облигации.
+_SECTYPE_KINDS = {"1": "share", "2": "share", "D": "receipt", "9": "fund", "A": "fund", "B": "fund",
+                  "E": "fund", "J": "fund", "I": "fund", "3": "bond", "4": "bond", "5": "bond", "6": "bond",
+                  "7": "bond", "8": "bond", "C": "bond"}
+
+
+def security_kind(sectype: Any, name: Optional[str] = None) -> str:
+    """Тип бумаги для фильтров (акции / фонды / расписки / облигации)."""
+    kind = _SECTYPE_KINDS.get(str(sectype or "").strip().upper())
+    if kind:
+        return kind
+    n = (name or "").upper()
+    if any(x in n for x in ("ПИФ", "ETF", "ФОНД")):
+        return "fund"
+    if any(x in n for x in ("ОБЛ", "ОФЗ")):
+        return "bond"
+    return "share" if sectype in (None, "") else "other"
