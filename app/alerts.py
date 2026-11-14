@@ -10,10 +10,32 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from .analysis import overheat
-from .settings_schema import ALERT_ACTIONS, ALERT_DIRECTIONS
+from .settings_schema import ALERT_ACTIONS, ALERT_DIRECTIONS, HISTORY_INTERVALS
 
 ARROWS = {"up_pulse": "▲", "down_pulse": "▼", "up_plate": "⏫", "down_plate": "⏬", "pump": "🚀",
-          "sector_dump": "⚠"}
+          "sector_dump": "⚠", "pinbar_level": "🎯"}
+# Действия «на покупку» — к ним применяется фильтр «исторический потолок» (issue #5, задача 1)
+BUY_ACTIONS = ("enter", "late", "rebound", "plateau_buy")
+# Тумблеры триггеров (issue #5, п. 16): тип сигнала → настройка
+TRIGGER_KEYS = {"up_pulse": "trig_up_pulse", "down_pulse": "trig_down_pulse", "up_plate": "trig_up_plate",
+                "down_plate": "trig_down_plate", "sector_dump": "trig_sector_dump",
+                "pinbar_level": "trig_pinbar"}
+
+
+def trigger_on(s: dict[str, Any], direction: str) -> bool:
+    key = TRIGGER_KEYS.get(direction)
+    return True if key is None else bool(s.get(key, True))
+
+
+def hist_range(snapshot: dict[str, Any], s: dict[str, Any]) -> Optional[tuple[float, float]]:
+    """(max, min) цены за период «Период истории для фильтров» — из дневных
+    свечей (P2, раз в день) и сегодняшней сессии; ``None`` — истории нет."""
+    ranges = snapshot.get("hist_ranges") or {}
+    r = ranges.get(str(s.get("history_interval") or "5d"))
+    if not r or not r[0] or not r[1] or r[1] <= 0:
+        return None
+    return float(r[0]), float(r[1])
+
 
 ACTION_LABELS = ALERT_ACTIONS
 
@@ -166,13 +188,36 @@ def evaluate(snapshot: dict[str, Any], s: dict[str, Any], intraday: Optional[dic
         checks[0]["note"] = f"выше максимума {amp_max}"
     pulse = amp_ok and (vol_ok or lvl_ok)
     is_plate = bool(plate.get("is_plate"))
+    # Тумблеры «Триггеры» (issue #5, п. 16): выключенный тип сигнала не срабатывает
+    snap_dir = int(snapshot.get("direction") or 0)
+    off = []
+    if pulse and not trigger_on(s, "up_pulse" if snap_dir >= 0 else "down_pulse"):
+        pulse = False
+        off.append(ALERT_DIRECTIONS["up_pulse" if snap_dir >= 0 else "down_pulse"])
+    if is_plate and not trigger_on(s, "up_plate" if int(plate.get("direction") or snap_dir) > 0 else "down_plate"):
+        is_plate = False
+        off.append(ALERT_DIRECTIONS["up_plate" if int(plate.get("direction") or snap_dir) > 0 else "down_plate"])
+    if off:
+        checks.append({"cond": "trigger_off", "label": "Триггер выключен в настройках", "value": ", ".join(off),
+                       "threshold": None, "passed": False, "ratio": 0.0, "shortfall": None})
     triggered = pulse or is_plate or pump_hit
+    # Потенциал движения (issue #5, задача 2): бумага, которая стоит на месте, не триггерит
+    min_rng = float(s.get("min_range_percent") or 0)
+    rng = hist_range(snapshot, s)
+    if min_rng > 0 and rng:
+        potential = (rng[0] - rng[1]) / rng[1] * 100
+        ok = potential >= min_rng
+        checks.append({**_check("potential", f"Размах за {HISTORY_INTERVALS.get(s.get('history_interval'), '')}, %",
+                                round(potential, 3), min_rng, ok), "note": "(max − min) / min × 100"})
+        if not ok:
+            triggered = False
     amp_r = min(checks[0]["ratio"], 1.0) if not (amp_max and amp > amp_max) else 0.0
     pulse_closeness = min(amp_r if not amp_ok else 1.0, max(min(checks[1]["ratio"], 1.0), level_closeness))
     plate_closeness = plate.get("score", 0) / max(plate.get("enabled", 4) or 4, 1) * (
         1.0 if plate.get("no_correction") or not s.get("plate_use_no_correction", True) else 0.5)
     pump_closeness = min(max(hour_atr / pump_k, 0.0), 1.0) if pump_search and pump_k else 0.0
-    closeness = 1.0 if triggered else round(max(pulse_closeness, plate_closeness, pump_closeness), 3)
+    closeness = 1.0 if triggered else round(min(max(pulse_closeness, plate_closeness, pump_closeness),
+                                                    0.99 if (pulse or is_plate or pump_hit or off) else 1.0), 3)
     failed = [c["cond"] for c in checks if not c["passed"]]
     ev = Evaluation(snapshot["ticker"], triggered, closeness, checks, failed)
     if not triggered or intraday is None:
@@ -249,7 +294,52 @@ def evaluate(snapshot: dict[str, Any], s: dict[str, Any], intraday: Optional[dic
     )
     if mute:
         ev.failed.append("pump_filter")
+        ev.alert.extra["mute_reason"] = "памп-фильтр"
+    apply_filters(ev.alert, snapshot, s)
+    if ev.alert.extra.get("mute_reason") and ev.alert.extra["mute_reason"] != "памп-фильтр":
+        ev.failed.append({"низкая ликвидность": "liquidity"}.get(ev.alert.extra["mute_reason"], "hist_ceiling"))
     return ev
+
+
+def apply_filters(alert: Alert, snapshot: dict[str, Any], s: dict[str, Any]) -> Alert:
+    """Фильтры P0 после выбора действия (issue #5): ликвидность (задача 4) и
+    исторический потолок (задача 1). Вызывается и повторно — после смены
+    действия на «плита после плато» (покупка) — поэтому идемпотентна."""
+    done = alert.extra.setdefault("filters_done", [])
+    filters = alert.extra.setdefault("filters", [])
+    # Ликвидность: доля минуток с ненулевым объёмом относительно эталона (SBER)
+    liq = snapshot.get("liquidity_score")
+    liq_min = float(s.get("liquidity_min_score") or 0)
+    alert.extra["liquidity_score"] = liq
+    if "liquidity" not in done and liq is not None and liq_min > 0 and liq < liq_min:
+        done.append("liquidity")
+        alert.labels.append(f"Низколиквидная ({liq:.2f})")
+        filters.append(f"ликвидность {liq:.2f} < {liq_min:g}")
+        alert.mute_push = True
+        alert.extra.setdefault("mute_reason", "низкая ликвидность")
+        if alert.action in BUY_ACTIONS:
+            alert.action = "filtered"
+        alert.reason += f"; фильтр: низкая ликвидность ({liq:.2f} < {liq_min:g})"
+    # Исторический потолок: не покупать в «опасной зоне» у максимума периода
+    rng = hist_range(snapshot, s)
+    if ("hist" not in done and s.get("hist_filter_enabled") and rng and alert.action in BUY_ACTIONS
+            and alert.price is not None):
+        hmax, hmin = rng
+        danger = hmax - (hmax - hmin) * float(s.get("correction_threshold_coef") or 0)
+        alert.extra["hist"] = {"max": hmax, "min": hmin, "danger": round(danger, 6),
+                               "interval": s.get("history_interval")}
+        if alert.price >= danger:
+            done.append("hist")
+            period = HISTORY_INTERVALS.get(str(s.get("history_interval")), s.get("history_interval"))
+            text = f"фильтр: исторический потолок (цена {alert.price:g} ≥ {danger:g}, max {hmax:g} за {period})"
+            filters.append(text)
+            alert.labels.append("исторический потолок")
+            alert.action = "filtered"
+            alert.mute_push = True
+            alert.extra.setdefault("mute_reason", "исторический потолок")
+            if text not in alert.reason:
+                alert.reason += "; " + text
+    return alert
 
 
 def _score(amp_n: float, vol_n: float, level: bool, plate_score: int) -> int:

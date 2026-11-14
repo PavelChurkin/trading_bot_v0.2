@@ -212,6 +212,25 @@ class DemoIss:
         return {"SECID": secid, "CURRENTVALUE": 2875.4, "LASTCHANGEPRC": -0.62, "LASTCHANGE": -17.9,
                 "OPENVALUE": 2893.3, "UPDATETIME": "18:44:59"}
 
+    async def index_candles(self, date_from: str, date_till: Optional[str] = None, secid: str = "IMOEX",
+                            interval: int = 24) -> list[dict[str, Any]]:
+        """Синтетический IMOEX (issue #5): средняя дневная доходность первых
+        бумаг вселенной + свой шум — часть бумаг коррелирует сильно, часть слабо."""
+        till = (date_till or "9999-12-31") + " 23:59:59"
+        core = list(UNIVERSE)[:6]
+        days = sorted({d["ts"] for t in core for d in self.daily[t]})
+        closes = {t: {d["ts"]: d["close"] for d in self.daily[t]} for t in core}
+        rnd = random.Random(f"imoex-{secid}")
+        out, value, prev = [], 2800.0, None
+        for ts in days:
+            if prev is not None:
+                rets = [closes[t][ts] / closes[t][prev] - 1 for t in core if ts in closes[t] and prev in closes[t]]
+                value *= 1 + (sum(rets) / len(rets) if rets else 0) + rnd.gauss(0, 0.003)
+            prev = ts
+            if date_from <= ts <= till:
+                out.append({"ts": ts, "open": value, "high": value * 1.004, "low": value * 0.996, "close": round(value, 2)})
+        return out
+
     async def candles(self, ticker: str, interval: int, date_from: str, date_till: Optional[str] = None,
                       **_: Any) -> list[dict[str, Any]]:
         till = (date_till or "9999-12-31") + " 23:59:59"

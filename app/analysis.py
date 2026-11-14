@@ -572,3 +572,122 @@ def make_verdict(price: float, day_change_pct: Optional[float], day: dict[str, A
         "stop": _r(stop, 4), "take": _r(take, 4), "risk_reward": _r(rr, 2),
     }
 
+
+
+# ------------------------------------------------- пин-бары (issue #5, задача 5)
+BULLISH_SWEEP, BEARISH_SWEEP = "BULLISH_SWEEP", "BEARISH_SWEEP"
+PINBAR_LABELS = {BULLISH_SWEEP: "бычий пин-бар (хвост вниз)", BEARISH_SWEEP: "медвежий пин-бар (хвост вверх)"}
+
+
+def detect_pinbar(candles: Sequence[dict[str, Any]], shadow_ratio: float, max_body_ratio: float,
+                  volume_z: Optional[float] = None, volume_window: int = 20) -> list[dict[str, Any]]:
+    """Свечи-«стрекозы» (liquidity sweep): резкий вынос цены с возвратом.
+
+    Для каждой закрытой свечи: ``body = |close − open|``, ``range = high − low``,
+    тени ``lower = min(open, close) − low``, ``upper = high − max(open, close)``.
+
+    * BULLISH_SWEEP (хвост вниз, цену откупили): ``lower ≥ body × shadow_ratio``,
+      ``body ≤ range × max_body_ratio`` и нижняя тень длиннее верхней;
+      ключевой уровень — ``low``;
+    * BEARISH_SWEEP (хвост вверх, цену слили) — зеркально, уровень — ``high``.
+
+    ``volume_z`` (> 0) — подтверждение объёмом: z-score объёма свечи
+    относительно ``volume_window`` предыдущих ≥ ``volume_z``.
+    Возвращает ``[{"ts", "type", "key_level", "shadow_ratio", "volume_z"}]``."""
+    out: list[dict[str, Any]] = []
+    for i, c in enumerate(candles):
+        try:
+            o, h, lo, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        full = h - lo
+        if full <= 0 or lo <= 0:
+            continue
+        body = abs(cl - o)
+        lower, upper = min(o, cl) - lo, h - max(o, cl)
+        if body > full * max_body_ratio:
+            continue
+        if lower > upper and lower > 0 and lower >= body * shadow_ratio:
+            kind, level, shadow = BULLISH_SWEEP, lo, lower
+        elif upper > lower and upper > 0 and upper >= body * shadow_ratio:
+            kind, level, shadow = BEARISH_SWEEP, h, upper
+        else:
+            continue
+        z = None
+        prev = [float(x.get("volume") or 0) for x in candles[max(0, i - volume_window):i]]
+        if len(prev) >= 5:
+            mean = sum(prev) / len(prev)
+            sd = (sum((v - mean) ** 2 for v in prev) / len(prev)) ** 0.5
+            vol = float(c.get("volume") or 0)
+            z = (vol - mean) / sd if sd > 0 else (0.0 if vol <= mean else float("inf"))
+        if volume_z and volume_z > 0 and (z is None or z < volume_z):
+            continue
+        out.append({"ts": c["ts"], "type": kind, "key_level": level,
+                    "shadow_ratio": round(shadow / body, 2) if body > 0 else None,
+                    "volume_z": None if z is None or z == float("inf") else round(z, 2)})
+    return out
+
+
+def pinbar_touched(kind: str, level: float, c: dict[str, Any]) -> bool:
+    """Свеча коснулась ключевого уровня пин-бара."""
+    return c["low"] <= level if kind == BULLISH_SWEEP else c["high"] >= level
+
+
+# ------------------------------------- статистика рынка (issue #5, задача 3)
+def pearson(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
+    n = len(xs)
+    if n < 2 or n != len(ys):
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    return sxy / (sxx * syy) ** 0.5
+
+
+def _returns(closes: dict[str, float], dates: list[str]) -> list[float]:
+    return [closes[b] / closes[a] - 1 for a, b in zip(dates, dates[1:])]
+
+
+def market_stats(hist: dict[str, list[list[Any]]], imoex: list[list[Any]], days: int = 30, week: int = 5,
+                 min_points: int = 10, high: float = 0.6, low: float = 0.3) -> dict[str, Any]:
+    """Общая картина рынка и связь бумаг с индексом.
+
+    ``hist`` — ``{тикер: [[дата, high, low, close], ...]}`` (дневные свечи),
+    ``imoex`` — ``[[дата, close], ...]``.
+
+    * среднее внутридневное колебание: (high − low) / low × 100 по дням за
+      ``days``, среднее по бумаге, затем по рынку;
+    * среднее недельное колебание: (max high − min low) / min low × 100 за
+      последние ``week`` торговых дней;
+    * корреляция Пирсона дневных доходностей бумаги и IMOEX за ``days`` дней
+      (по общим датам, минимум ``min_points`` доходностей); список по убыванию,
+      «высокая» ≥ ``high``, «низкая» < ``low``."""
+    idx = {str(d): float(c) for d, c in imoex if c}
+    rows: list[dict[str, Any]] = []
+    for t, h in hist.items():
+        h = [x for x in h if x[1] and x[2] and x[3] and x[2] > 0][-days:]
+        if not h:
+            continue
+        intraday = sum((x[1] - x[2]) / x[2] * 100 for x in h) / len(h)
+        wk = h[-week:]
+        weekly = (max(x[1] for x in wk) - min(x[2] for x in wk)) / min(x[2] for x in wk) * 100
+        row: dict[str, Any] = {"ticker": t, "intraday_pct": round(intraday, 3), "weekly_pct": round(weekly, 3),
+                               "corr": None, "n": 0}
+        closes = {str(x[0]): float(x[3]) for x in h}
+        common = sorted(d for d in closes if d in idx)[-(days + 1):]
+        if len(common) - 1 >= min_points:
+            r = pearson(_returns(closes, common), _returns(idx, common))
+            row.update({"corr": None if r is None else round(r, 3), "n": len(common) - 1})
+        rows.append(row)
+    corr = sorted((r for r in rows if r["corr"] is not None), key=lambda r: -r["corr"])
+
+    def avg(k: str) -> Optional[float]:
+        return round(sum(r[k] for r in rows) / len(rows), 3) if rows else None
+
+    return {"days": days, "week": week, "tickers": len(rows), "avg_intraday_pct": avg("intraday_pct"),
+            "avg_weekly_pct": avg("weekly_pct"), "imoex_points": len(idx), "correlation": corr,
+            "high": [r["ticker"] for r in corr if r["corr"] >= high],
+            "low": [r["ticker"] for r in corr if r["corr"] < low], "high_threshold": high, "low_threshold": low}

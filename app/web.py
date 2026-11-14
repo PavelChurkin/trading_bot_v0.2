@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from . import alerts as al
 from . import analysis as an
 from . import auth
 from . import charts
+from . import paper
 from . import settings_schema as ss
 from .db import Database
 from .push import PushService
@@ -92,7 +94,14 @@ def create_app(ctx: AppContext) -> FastAPI:
     async def api_me(user: dict = Depends(current_user)):
         return {"user": user, "is_admin": user["role"] == "admin", "vapid_public_key": push.public_key,
                 "push_available": push.available, "push_error": push.error,
-                "devices": len(push.subscriptions(user["id"]))}
+                "devices": len(push.subscriptions(user["id"])), "away_since": scanner.away_since(user["id"]),
+                "disk_paused": db.get_state("disk_paused")}
+
+    @app.post("/api/away")
+    async def api_away(body: dict, user: dict = Depends(current_user)):
+        """Режим «Отошёл» (issue #5): пуши замораживаются; при возвращении
+        досылаются сигналы двух последних сканирований (≤ 10 + сводный)."""
+        return await scanner.set_away(user["id"], bool(body.get("on")))
 
     # ============================================================== статус
     @app.get("/api/status")
@@ -183,9 +192,24 @@ def create_app(ctx: AppContext) -> FastAPI:
 
     @app.post("/api/admin/purge")
     async def api_purge(user: dict = Depends(admin_user)):
-        """Очистка по сроку хранения прямо сейчас (обычно — раз в сутки в фоне)."""
+        """«Освободить память»: удалить данные старше срока хранения и сжать
+        базу (VACUUM), чтобы место вернулось на диск. Размер до/после."""
         days = int(db.global_settings()["retention_days"])
-        return {"ok": True, "days": days, "deleted": db.purge_older_than(days)}
+        before = db.size_bytes()
+        deleted = db.purge_older_than(days)
+        await asyncio.to_thread(db.vacuum)
+        return {"ok": True, "days": days, "deleted": deleted, "before_bytes": before, "after_bytes": db.size_bytes(),
+                "storage": scanner.storage()}
+
+    @app.get("/api/admin/storage")
+    async def api_storage(user: dict = Depends(admin_user)):
+        """Размер базы и свободное место на диске."""
+        return scanner.storage()
+
+    @app.post("/api/admin/storage/check")
+    async def api_storage_check(user: dict = Depends(admin_user)):
+        """«Проверить память»: места достаточно — сканер снимается с паузы."""
+        return scanner.check_storage()
 
     @app.post("/api/admin/stop")
     async def api_stop(user: dict = Depends(admin_user)):
@@ -258,7 +282,8 @@ def create_app(ctx: AppContext) -> FastAPI:
         sec = scanner.securities.get(ticker) or {}
         row = {"ticker": ticker, "name": sec.get("name"), "price": sec.get("last"), "sectype": sec.get("sectype"),
                "day_change_pct": sec.get("day_change_pct"), "volume_today": sec.get("volume_today"),
-               "value_today": sec.get("value_today"), "daily_atr_pct": sec.get("daily_atr_pct")}
+               "value_today": sec.get("value_today"), "daily_atr_pct": sec.get("daily_atr_pct"),
+               "liquidity_score": sec.get("liquidity_score")}
         if snap:
             ev = al.evaluate(snap, s)
             row.update({k: snap.get(k) for k in ("amplitude_pct", "amplitude_atr", "atr", "volume", "volume_ratio",
@@ -278,6 +303,7 @@ def create_app(ctx: AppContext) -> FastAPI:
         snaps = db.snapshots(int(s["candle_window_min"]))
         favs = {r["ticker"] for r in db.query("SELECT ticker FROM favorites WHERE key_id = ?", (user["id"],))}
         papers = _open_papers(user["id"])
+        last = _last_actions(user["id"])
         rows = []
         for t, sec in scanner.securities.items():
             if not sec.get("active"):
@@ -285,6 +311,11 @@ def create_app(ctx: AppContext) -> FastAPI:
             r = _row(t, snaps.get(t), s)
             r["favorite"] = t in favs
             r["paper"] = papers.get(t)
+            if t in last:
+                la = last[t]
+                r["last_action"] = la["action"]
+                r["last_action_label"] = al.ACTION_LABELS.get(la["action"], la["action"])
+                r["last_action_ts"] = la["ts"]
             rows.append(r)
         rows.sort(key=lambda r: (-(r.get("threshold_closeness") or 0), r["ticker"]))
         return {"columns": s["dashboard_columns"], "labels": ss.DASHBOARD_COLUMNS, "kinds": ss.SECURITY_KINDS,
@@ -313,7 +344,16 @@ def create_app(ctx: AppContext) -> FastAPI:
                 "alerts": [al.alert_from_row(r) for r in alerts_rows], "analysis": last_detail,
                 "favorite": bool(db.query_one("SELECT 1 FROM favorites WHERE key_id = ? AND ticker = ?",
                                               (user["id"], ticker))),
-                "paper": _open_papers(user["id"]).get(ticker)}
+                "paper": _open_papers(user["id"]).get(ticker),
+                "levels": scanner.pinbar_levels(ticker, fmt_ts(now_msk() - timedelta(days=max(1, min(days, 31)))))}
+
+    def _last_actions(key_id: int) -> dict[str, dict[str, Any]]:
+        """Рекомендованное действие из последнего алерта пользователя по тикеру
+        (колонка «Действия», issue #5)."""
+        rows = db.query("SELECT a.ticker, a.action, a.ts FROM alerts a JOIN (SELECT ticker, MAX(id) AS id FROM alerts "
+                        "WHERE key_id = ? AND ticker != 'РЫНОК' AND action IS NOT NULL GROUP BY ticker) m "
+                        "ON a.id = m.id", (key_id,))
+        return {r["ticker"]: r for r in rows}
 
     def _open_papers(key_id: int) -> dict[str, dict[str, Any]]:
         """Последняя открытая paper-позиция по каждому тикеру пользователя."""
@@ -438,7 +478,7 @@ def create_app(ctx: AppContext) -> FastAPI:
     async def api_alerts(scope: str = "mine", ticker: Optional[str] = None, direction: Optional[str] = None,
                          day: Optional[str] = None, limit: int = 200, fav: bool = False, kind: Optional[str] = None,
                          action: Optional[str] = None, sort: str = "time", triggered: bool = False,
-                         user: dict = Depends(current_user)):
+                         time: Optional[str] = None, user: dict = Depends(current_user)):
         """История сигналов (п. 9). ``scope=mine`` — алерты по моим порогам
         (с отметкой отправлен/подавлен), ``scope=all`` — общий журнал сканера.
 
@@ -464,6 +504,13 @@ def create_app(ctx: AppContext) -> FastAPI:
         if day:
             where.append("substr(a.ts,1,10) = ?")
             params.append(day)
+        if time:
+            # Фильтр по времени (issue #5): сигналы начиная с HH:MM выбранного дня (или сегодня)
+            if not re.fullmatch(r"\d{1,2}:\d{2}", time):
+                raise HTTPException(422, "Время в формате ЧЧ:ММ")
+            hh, mm = time.split(":")
+            where.append("a.ts >= ?")
+            params.append(f"{day or now_msk().strftime('%Y-%m-%d')} {int(hh):02d}:{mm}:00")
         if fav:
             where.append("a.ticker IN (SELECT ticker FROM favorites WHERE key_id = ?)")
             params.append(user["id"])
@@ -541,7 +588,8 @@ def create_app(ctx: AppContext) -> FastAPI:
         reports = db.query("SELECT day, MAX(created_at) AS created_at FROM daily_reports WHERE key_id = ? OR "
                            "key_id IS NULL GROUP BY day ORDER BY day DESC LIMIT 30", (user["id"],))
         return {"day": day, "live": live, "stored": json.loads(stored["data"]) if stored else None,
-                "days": reports, "report_time": db.effective_settings(user["id"])["daily_report_time"]}
+                "days": reports, "report_time": db.effective_settings(user["id"])["daily_report_time"],
+                "market_stats": scanner.market_stats()}
 
     @app.post("/api/report/send")
     async def api_report_send(user: dict = Depends(current_user)):
@@ -551,32 +599,53 @@ def create_app(ctx: AppContext) -> FastAPI:
         return rep
 
     # ======================================================= paper trading
-    def _paper_row(r: dict[str, Any]) -> dict[str, Any]:
+    def _paper_row(r: dict[str, Any], s: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         sec = scanner.securities.get(r["ticker"]) or {}
         r["lot"] = sec.get("lot")
         r["notified"] = json.loads(r.get("notified") or "{}")
+        r["name"] = sec.get("name")
         if r["status"] == "open" and sec.get("last"):
             pct, rub = scanner.paper_pnl(r, sec["last"])
             r["current_price"] = sec["last"]
             r["unrealized_pct"] = pct
             r["unrealized_rub"] = rub
+        if s is not None:  # деньги с комиссиями брокера и налогом (issue #5, п. 4)
+            price = r.get("exit_price") if r["status"] != "open" else r.get("current_price")
+            r["money"] = paper.money(r, s, price)
+        r["levels_valid"] = paper.levels_ok(r["side"], r["entry_price"], r.get("stop"), r.get("take")) \
+            or bool(r.get("levels_at"))
         return r
 
     @app.get("/api/paper")
     async def api_paper(user: dict = Depends(current_user)):
-        rows = [_paper_row(r) for r in db.query("SELECT * FROM paper_trades WHERE key_id = ? ORDER BY id DESC LIMIT 300",
-                                                (user["id"],))]
-        closed = [r for r in rows if r["status"] != "open" and r.get("result_pct") is not None]
-        stats = {"open": sum(1 for r in rows if r["status"] == "open"), "closed": len(closed),
-                 "wins": sum(1 for r in closed if r["result_pct"] > 0),
-                 "total_pct": round(sum(r["result_pct"] for r in closed), 3),
-                 "total_rub": round(sum(r.get("profit_rub") or 0 for r in closed), 2),
-                 "open_rub": round(sum(r.get("unrealized_rub") or 0 for r in rows if r["status"] == "open"), 2)}
-        stats["winrate"] = round(stats["wins"] / len(closed) * 100, 1) if closed else None
         s = db.effective_settings(user["id"])
+        rows = [_paper_row(r, s) for r in db.query(
+            "SELECT * FROM paper_trades WHERE key_id = ? ORDER BY id DESC LIMIT 300", (user["id"],))]
+        closed = [r for r in rows if r["status"] != "open" and r.get("result_pct") is not None]
+        opened = [r for r in rows if r["status"] == "open"]
+
+        def total(items: list[dict[str, Any]], k: str) -> float:
+            return round(sum((r.get("money") or {}).get(k) or 0 for r in items), 2)
+
+        stats = {"open": len(opened), "closed": len(closed),
+                 "wins": sum(1 for r in closed if r["result_pct"] > 0),
+                 "total_rub": round(sum(r.get("profit_rub") or 0 for r in closed), 2),
+                 "open_rub": round(sum(r.get("unrealized_rub") or 0 for r in opened), 2),
+                 # Потрачено на покупку бумаг с комиссией входа: всего и в открытых позициях
+                 "spent_rub": total(rows, "cost_rub"), "spent_open_rub": total(opened, "cost_rub"),
+                 "fees_rub": total(rows, "fee_rub"), "tax_rub": total(closed, "tax_rub"),
+                 "net_rub": total(closed, "net_rub")}
+        stats["winrate"] = round(stats["wins"] / len(closed) * 100, 1) if closed else None
         return {"trades": rows, "stats": stats,
                 "settings": {k: s.get(k) for k in ("paper_auto_close", "paper_notify_enabled", "paper_target_pct",
-                                                    "paper_target_rub")}}
+                                                    "paper_target_rub", "paper_default_side", "fee_entry_pct",
+                                                    "fee_exit_pct", "tax_profit_pct")}}
+
+    @app.delete("/api/paper")
+    async def api_paper_clear(user: dict = Depends(current_user)):
+        """«Очистить статистику» (issue #5, п. 13): удалить все свои paper-сделки."""
+        n = db.execute("DELETE FROM paper_trades WHERE key_id = ?", (user["id"],)).rowcount
+        return {"deleted": n, **(await api_paper(user))}
 
     def _qty(value: Any) -> Optional[float]:
         if value in (None, ""):
@@ -589,6 +658,22 @@ def create_app(ctx: AppContext) -> FastAPI:
             raise HTTPException(422, "Количество должно быть больше 0")
         return q
 
+    def _level(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "Стоп/тейк — число") from None
+
+    def _default_side(alert: Optional[dict[str, Any]], s: dict[str, Any]) -> str:
+        """Сторона по умолчанию: настройка «Paper: сторона» (лонг/шорт) или
+        «авто» — шорт по «плите вверх», иначе лонг (issue #5, п. 5)."""
+        pref = s.get("paper_default_side") or "auto"
+        if pref in ("long", "short"):
+            return pref
+        return "short" if alert and alert["direction"] in ("up_plate",) else "long"
+
     def _open_paper(user: dict, body: dict) -> int:
         alert = None
         if body.get("alert_id"):
@@ -598,29 +683,44 @@ def create_app(ctx: AppContext) -> FastAPI:
         if ticker not in scanner.securities:
             raise HTTPException(404, "Тикер не найден")
         sec = scanner.securities[ticker]
-        side = body.get("side") or ("short" if alert and alert["direction"] in ("up_plate",) else "long")
+        s = db.effective_settings(user["id"])
+        side = body.get("side") or _default_side(alert, s)
         if side not in ("long", "short"):
             raise HTTPException(422, "side: long или short")
-        entry = float(body.get("entry_price") or sec.get("last") or (alert or {}).get("price") or 0)
+        try:
+            entry = float(body.get("entry_price") or sec.get("last") or (alert or {}).get("price") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "Цена входа — число") from None
         if entry <= 0:
             raise HTTPException(422, "Нет цены входа")
         qty = _qty(body.get("qty"))
         if qty is None:
             qty = float(sec.get("lot") or 1)  # по умолчанию — один лот
         extra = (alert or {}).get("extra") or {}
-        stop = body.get("stop", extra.get("stop"))
-        take = body.get("take", extra.get("take"))
-        if stop is None or take is None:  # по умолчанию — от дневного ATR
-            s = db.effective_settings(user["id"])
-            atr_pct = sec.get("daily_atr_pct") or 2.0
-            sign = 1 if side == "long" else -1
-            stop = stop if stop is not None else entry * (1 - sign * s["stop_atr_mult"] * atr_pct / 100)
-            take = take if take is not None else entry * (1 + sign * s["take_atr_mult"] * atr_pct / 100)
+        # Уровни из вердикта алерта — от цены алерта и, возможно, для другой стороны:
+        # переносим к цене входа и проверяем ориентацию (корень бага MGKL/TATN, issue #5)
+        stop, take, note = paper.default_levels(
+            side, entry, _level(extra.get("stop")), _level(extra.get("take")),
+            anchor=(alert or {}).get("price"), atr_pct=sec.get("daily_atr_pct"),
+            stop_mult=s["stop_atr_mult"], take_mult=s["take_atr_mult"])
+        for kind in ("stop", "take"):  # уровни, заданные вручную, проверяются от цены входа
+            if body.get(kind) not in (None, ""):
+                v = _level(body[kind])
+                err = paper.manual_level_error(side, kind, v, entry)
+                if err:
+                    raise HTTPException(422, err)
+                if kind == "stop":
+                    stop = v
+                else:
+                    take = v
+        user_note = str(body.get("note") or "")
+        if note and not user_note:
+            user_note = note
         cur = db.execute(
             "INSERT INTO paper_trades (key_id, ticker, side, entry_price, stop, take, alert_id, note, opened_at, qty) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (user["id"], ticker, side, entry, float(stop), float(take), body.get("alert_id"),
-             str(body.get("note") or "")[:300], fmt_ts(now_msk()), qty))
+            (user["id"], ticker, side, entry, stop, take, body.get("alert_id"),
+             user_note[:300], fmt_ts(now_msk()), qty))
         return int(cur.lastrowid)
 
     @app.post("/api/paper")
@@ -641,8 +741,12 @@ def create_app(ctx: AppContext) -> FastAPI:
 
     @app.patch("/api/paper/{trade_id}")
     async def api_paper_edit(trade_id: int, body: dict, user: dict = Depends(current_user)):
-        """Количество / стоп / тейк / заметка по сделке (количество можно
-        задать и у закрытой — тогда пересчитывается профит в ₽)."""
+        """Количество / стоп / тейк / сторона / заметка по сделке (количество
+        можно задать и у закрытой — тогда пересчитывается профит в ₽).
+
+        Стоп и тейк правятся вручную (issue #5, п. 3): уровень проверяется от
+        текущей цены, а проверка срабатывания идёт только по свечам ПОСЛЕ
+        правки (``levels_at``) — прошлые минутки сделку не закрывают."""
         t = db.query_one("SELECT * FROM paper_trades WHERE id = ? AND key_id = ?", (trade_id, user["id"]))
         if not t:
             raise HTTPException(404, "Сделка не найдена")
@@ -651,14 +755,31 @@ def create_app(ctx: AppContext) -> FastAPI:
             t["qty"] = _qty(body["qty"])
             sets.append("qty = ?")
             params.append(t["qty"])
+        levels_changed = False
+        if "side" in body and body["side"] != t["side"]:
+            if t["status"] != "open":
+                raise HTTPException(422, "Сторону можно сменить только у открытой сделки")
+            if body["side"] not in ("long", "short"):
+                raise HTTPException(422, "side: long или short")
+            stop, take = paper.flip_levels(t["entry_price"], t.get("stop"), t.get("take"))
+            t.update({"side": body["side"], "stop": stop, "take": take})
+            sets += ["side = ?", "stop = ?", "take = ?"]
+            params += [t["side"], stop, take]
+            levels_changed = True
+        ref = (scanner.securities.get(t["ticker"]) or {}).get("last") or t["entry_price"]
         for k in ("stop", "take"):
             if k in body:
-                v = body[k]
+                v = _level(body[k])
+                if t["status"] == "open":
+                    err = paper.manual_level_error(t["side"], k, v, ref)
+                    if err:
+                        raise HTTPException(422, err)
                 sets.append(f"{k} = ?")
-                try:
-                    params.append(None if v in (None, "") else float(v))
-                except (TypeError, ValueError):
-                    raise HTTPException(422, "Стоп/тейк — число") from None
+                params.append(v)
+                levels_changed = True
+        if levels_changed and t["status"] == "open":
+            sets.append("levels_at = ?")
+            params.append(fmt_ts(now_msk()))
         if "note" in body:
             sets.append("note = ?")
             params.append(str(body["note"] or "")[:300])

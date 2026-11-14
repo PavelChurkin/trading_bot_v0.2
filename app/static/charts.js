@@ -29,6 +29,8 @@
     if (v === null || v === undefined || Number.isNaN(v)) return "—";
     const a = Math.abs(v);
     if (nd === undefined) nd = a >= 1000 ? 0 : a >= 100 ? 1 : a >= 1 ? 2 : 4;
+    // −0,004 при nd=2 округляется в «-0» — показываем просто «0»
+    if (Number(Number(v).toFixed(Math.min(nd, 20))) === 0) v = 0;
     return Number(v).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: nd });
   }
 
@@ -193,7 +195,12 @@
     const bb = opts.bb;
     const series = [candles.map((c) => c[2]), candles.map((c) => c[3])];
     if (bb) series.push(bb.upper, bb.lower);
-    const [lo, hi] = range(series);
+    // Уровни скрытой ликвидности (пин-бары, issue #5): учитываем в масштабе только
+    // уровни в пределах ±15 % от диапазона свечей, чтобы далёкий уровень не сжал график.
+    const levels = (opts.levels || []).filter((l) => l && isFinite(l.key_level));
+    const [lo0, hi0] = range(series);
+    const near = levels.filter((l) => l.key_level >= lo0 - (hi0 - lo0) * 0.15 && l.key_level <= hi0 + (hi0 - lo0) * 0.15);
+    const [lo, hi] = range(series.concat([near.map((l) => l.key_level)]));
     const f = frame(container, { n, min: lo, max: hi, labels, height: opts.height || 240, title: "Свечи",
       step: opts.step, group: opts.group });
     // объём — нижние 22% поля, своя доля высоты (не вторая ось: подписей нет, только форма)
@@ -211,6 +218,27 @@
       path(f, bb.middle, C.s1, 1, "2 3");
       path(f, bb.lower, C.s1, 1.5);
     }
+    // горизонтальные линии уровней: от свечи пин-бара до отработки (или до правого края);
+    // подпись — только у неотработанных уровней и без наложения друг на друга
+    const usedY = [];
+    for (const l of near) {
+      const bull = l.pattern_type === "BULLISH_SWEEP", col = bull ? C.up : C.down;
+      const idx = (ts) => { const i = labels.findIndex((x) => x >= ts); return i < 0 ? n - 1 : i; };
+      const i0 = l.ts < labels[0] ? 0 : idx(l.ts);
+      const i1 = l.worked_out && l.worked_at ? Math.max(i0, idx(l.worked_at)) : n - 1;
+      const yv = f.y(l.key_level);
+      const ln = el("line", { x1: f.x(i0), x2: l.worked_out ? f.x(i1) : PAD.l + f.pw, y1: yv, y2: yv, stroke: col,
+        "stroke-width": l.worked_out ? 1 : 1.5, "stroke-dasharray": l.worked_out ? "2 3" : "6 3",
+        opacity: l.worked_out ? 0.55 : 0.95, class: "liq-level" }, f.svg);
+      const tip = el("title", {}, ln);
+      tip.textContent = `Уровень скрытой ликвидности ${fmt(l.key_level)} · ${l.label || ""} · ${shortTs(l.ts)}` +
+        (l.worked_out ? ` · отработан ${shortTs(l.worked_at)}` : " · активен");
+      if (l.worked_out || usedY.some((v) => Math.abs(v - yv) < 12)) continue;
+      usedY.push(yv);
+      const tx = el("text", { x: PAD.l + f.pw - 4, y: yv + (bull ? 12 : -4), fill: col, "font-size": 10,
+        "text-anchor": "end", class: "liq-label", stroke: "#0d1220", "stroke-width": 3, "paint-order": "stroke" }, f.svg);
+      tx.textContent = "Уровень скрытой ликвидности " + fmt(l.key_level);
+    }
     const g = el("g", {}, f.svg);
     candles.forEach((c, i) => {
       const up = c[4] >= c[1], col = up ? C.up : C.down;
@@ -225,6 +253,10 @@
     t.textContent = fmt(last);
     const items = [{ name: "Рост (полая)", color: C.up }, { name: "Падение", color: C.down }];
     if (bb) items.push({ name: "Боллинджер 20/2", color: C.s1 });
+    if (near.some((l) => l.pattern_type === "BULLISH_SWEEP"))
+      items.push({ name: "Уровень скрытой ликвидности (бычий пин-бар)", color: C.up, dash: true });
+    if (near.some((l) => l.pattern_type !== "BULLISH_SWEEP"))
+      items.push({ name: "Уровень скрытой ликвидности (медвежий пин-бар)", color: C.down, dash: true });
     legend(container, items);
     hover(container, f, labels, (i) => {
       const c = candles[i];

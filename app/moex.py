@@ -126,6 +126,17 @@ class IssClient:
         rows = table(data, "marketdata")
         return rows[0] if rows else None
 
+    async def index_candles(self, date_from: str, date_till: Optional[str] = None, secid: str = "IMOEX",
+                            interval: int = 24) -> list[dict[str, Any]]:
+        """Дневные свечи индекса (issue #5, задача 3 — корреляция с IMOEX)."""
+        params: dict[str, Any] = {"interval": interval, "from": date_from}
+        if date_till:
+            params["till"] = date_till
+        data = await self.get(f"/engines/stock/markets/index/securities/{secid}/candles", params,
+                              cache_ttl=seconds_to_next_candle(interval))
+        return [{"ts": r["begin"], "open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"]}
+                for r in table(data, "candles")]
+
     # ----------------------------------------------------------------- свечи
     async def candles_page(self, ticker: str, interval: int, date_from: str, date_till: Optional[str] = None,
                            start: int = 0) -> list[dict[str, Any]]:
