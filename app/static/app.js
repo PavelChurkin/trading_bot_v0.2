@@ -23,8 +23,10 @@
   const condLabels = (failed) => (failed || "").split(",").filter(Boolean).map((c) => COND[c] || c).join(", ");
   function pct(v, nd) {
     if (v === null || v === undefined) return '<span class="muted">—</span>';
-    const cls = v > 0 ? "up" : v < 0 ? "down" : "";
-    return `<span class="${cls}">${v > 0 ? "+" : ""}${num(v, nd === undefined ? 2 : nd)}%</span>`;
+    const d = nd === undefined ? 2 : nd;
+    const r = Number(Number(v).toFixed(d)); // знак и цвет — по округлённому значению (без «-0%»)
+    const cls = r > 0 ? "up" : r < 0 ? "down" : "";
+    return `<span class="${cls}">${r > 0 ? "+" : ""}${num(v, d)}%</span>`;
   }
   function compact(v) {
     if (v === null || v === undefined) return "—";
@@ -786,8 +788,14 @@
     const th = (k, label, num_) => `<th data-psort="${k}" class="${num_ ? "num" : ""} ${sk.key === k ? "sorted" + (sk.asc ? " asc" : "") : ""}">${label}</th>`;
     const st = r.stats;
     const ps = r.settings || {};
-    const rub = (v) => (v === null || v === undefined ? '<span class="muted">—</span>'
-      : `<span class="${v > 0 ? "up" : v < 0 ? "down" : ""}">${v > 0 ? "+" : ""}${num(v, 2)} ₽</span>`);
+    const rub = (v) => {
+      if (v === null || v === undefined) return '<span class="muted">—</span>';
+      const r = Math.round(v * 100) / 100;
+      return `<span class="${r > 0 ? "up" : r < 0 ? "down" : ""}">${r > 0 ? "+" : ""}${num(v, 2)} ₽</span>`;
+    };
+    // Значение стопа/тейка в поле ввода — без «хвоста» float (644.12147922399 → 644.12)
+    const lvlVal = (v) => (v === null || v === undefined ? ""
+      : Number(Number(v).toFixed(Math.abs(v) >= 100 ? 2 : Math.abs(v) >= 1 ? 4 : 6)));
     view.innerHTML = `<div class="card"><h2>Paper trading <span class="muted small">· симуляция сделок: сопровождение, пуши на выход, профит в ₽</span></h2>
       <div class="stats">${stat("Открыто", st.open)}${stat("Закрыто", st.closed)}${stat("Прибыльных", st.wins)}
         ${stat("Винрейт", st.winrate === null ? "—" : num(st.winrate, 1) + "%")}
@@ -815,7 +823,7 @@
           <td class="num"><input class="qty" type="number" min="0" step="any" data-qty="${t.id}" value="${t.qty ?? ""}" placeholder="—" title="Количество акций${t.lot ? " (лот " + t.lot + ")" : ""}"></td>
           <td class="num">${num(t.entry_price)}</td>
           ${["stop", "take"].map((k) => `<td class="num">${t.status === "open"
-            ? `<input class="lvl ${t.levels_valid ? "" : "bad"}" type="number" step="any" data-lvl="${k}" data-id="${t.id}" value="${t[k] ?? ""}" placeholder="—"
+            ? `<input class="lvl ${t.levels_valid ? "" : "bad"}" type="number" step="any" data-lvl="${k}" data-id="${t.id}" value="${lvlVal(t[k])}" placeholder="—"
                 title="${k === "stop" ? "Стоп" : "Тейк"}: правка вручную — срабатывание проверяется только по свечам после правки${t.levels_valid ? "" : " · уровни не соответствуют стороне"}">`
             : num(t[k])}</td>`).join("")}
           <td class="num">${num(t.status === "open" ? t.current_price : t.exit_price)}</td>
@@ -945,25 +953,26 @@
     // «↺» — вернуть одно поле к значению по умолчанию (issue #5, п. 5)
     const reset = resettable && overridden
       ? `<button type="button" class="reset-btn" data-reset="${sp.key}" title="Вернуть значение по умолчанию">↺</button>` : "";
-    const help = (sp.help ? `<span class="help">${esc(sp.help)}</span>` : "") + reset;
+    const help = sp.help ? `<span class="help">${esc(sp.help)}</span>` : "";
+    const label = `<span>${esc(sp.label)}${reset}</span>`;
     const range = [sp.min !== null ? "мин " + sp.min : "", sp.max !== null ? "макс " + sp.max : ""].filter(Boolean).join(", ");
     const cls = `field ${overridden ? "overridden" : ""}`;
     if (sp.type === "bool") {
-      return `<label class="${cls} check"><input type="checkbox" id="${id}" data-key="${sp.key}" ${value ? "checked" : ""}><span>${esc(sp.label)}</span>${help}</label>`;
+      return `<label class="${cls} check"><input type="checkbox" id="${id}" data-key="${sp.key}" ${value ? "checked" : ""}>${label}${help}</label>`;
     }
     if (sp.type === "list") {
-      return `<div class="${cls} wide"><span>${esc(sp.label)}</span><div class="choices" data-key="${sp.key}" data-list="1">
+      return `<div class="${cls} wide">${label}<div class="choices" data-key="${sp.key}" data-list="1">
         ${Object.entries(sp.choices).map(([k, l]) => `<label><input type="checkbox" value="${k}" ${(value || []).includes(k) ? "checked" : ""}> ${esc(l)}</label>`).join("")}
         </div>${help}</div>`;
     }
     if (sp.type === "str" && sp.choices) {
-      return `<label class="${cls}"><span>${esc(sp.label)}</span>
+      return `<label class="${cls}">${label}
         <select id="${id}" data-key="${sp.key}">${Object.entries(sp.choices).map(([k, l]) =>
           `<option value="${esc(k)}" ${String(value) === k ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>${help}</label>`;
     }
     const type = sp.type === "time" ? "time" : sp.type === "str" ? "text" : "number";
     const step = sp.type === "float" ? "any" : "1";
-    return `<label class="${cls} ${sp.type === "str" ? "wide" : ""}"><span>${esc(sp.label)}</span>
+    return `<label class="${cls} ${sp.type === "str" ? "wide" : ""}">${label}
       <input id="${id}" data-key="${sp.key}" type="${type}" step="${step}" ${sp.min !== null ? `min="${sp.min}"` : ""} ${sp.max !== null ? `max="${sp.max}"` : ""}
         value="${esc(value)}">${help || (range ? `<span class="help">${range}</span>` : "")}</label>`;
   }

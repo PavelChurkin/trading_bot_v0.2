@@ -121,7 +121,7 @@ button:disabled { opacity: .5; cursor: progress; }
 .field .help { color: var(--muted); font-size: 12px; }
 .field.check { grid-template-columns: auto 1fr; align-items: center; column-gap: 8px; }
 .field.check .help { grid-column: 2; }
-.overridden > span::after { content: " • свой"; color: var(--accent); font-size: 11px; }
+.overridden > span:first-of-type::after { content: " • свой"; color: var(--accent); font-size: 11px; }
 .choices { display: flex; flex-wrap: wrap; gap: 6px 14px; }
 .choices label { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--ink-2); }
 fieldset { border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; margin: 0 0 14px; display: grid; gap: 12px;
@@ -242,8 +242,9 @@ input.qty { width: 90px; text-align: right; padding: 4px 6px; }
 input.lvl { width: 90px; text-align: right; padding: 4px 6px; }
 input.lvl.bad { border-color: var(--warn); }
 select.side { padding: 3px 6px; }
-.reset-btn { background: none; border: 1px solid var(--line-2); border-radius: 6px; color: var(--muted); cursor: pointer;
-  padding: 0 6px; font-size: 12px; align-self: flex-start; margin-top: 2px; min-height: 0; }
+.field > span:first-of-type:has(.reset-btn) { display: flex; align-items: center; gap: 4px; }
+.reset-btn { order: 1; margin-left: auto; background: none; border: 1px solid var(--line-2); border-radius: 6px; color: var(--muted);
+  cursor: pointer; padding: 0 6px; font-size: 12px; line-height: 18px; min-height: 0; flex: none; }
 .reset-btn:hover { color: var(--accent); border-color: var(--accent); }
 .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 .switch input { width: 36px; height: 20px; appearance: none; -webkit-appearance: none; background: var(--line-2);

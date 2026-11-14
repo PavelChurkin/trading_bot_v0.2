@@ -29,6 +29,8 @@
     if (v === null || v === undefined || Number.isNaN(v)) return "—";
     const a = Math.abs(v);
     if (nd === undefined) nd = a >= 1000 ? 0 : a >= 100 ? 1 : a >= 1 ? 2 : 4;
+    // −0,004 при nd=2 округляется в «-0» — показываем просто «0»
+    if (Number(Number(v).toFixed(Math.min(nd, 20))) === 0) v = 0;
     return Number(v).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: nd });
   }
 
