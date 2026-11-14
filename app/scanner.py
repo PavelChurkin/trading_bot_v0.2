@@ -22,13 +22,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import time
 from datetime import timedelta
 from typing import Any, Optional
 
 from . import alerts as al
-from . import paper
 from . import analysis as an
+from . import paper
+from .settings_schema import HISTORY_DAYS
 from .auth import active_user_ids
 from .db import Database
 from .moex import IssClient, OrderbookUnavailable, security_kind
@@ -50,6 +52,9 @@ TRACK_ENTER_ACTIONS = ("unique_enter", "your_enter")
 PAPER_EXIT_ACTIONS = {"avoid": "фиксировать", "rebound": "кандидат на откуп", "selloff": "распродажа",
                       "market": "рыночный шок"}
 WARMUP_REASON = "прогрев: первый цикл после запуска/перерыва"
+AWAY_REASON = "отошёл"  # режим «Отошёл» (issue #5): пуши заморожены
+AWAY_MAX_PUSHES = 10  # при возвращении — не больше N отдельных пушей, остальное сводкой
+DAILY_HIST_KEEP = 70  # дневных свечей в памяти для фильтров/статистики (3 мес ≈ 63 торговых дня)
 BLUE_CHIPS = ["SBER", "GAZP", "LKOH", "ROSN", "NVTK", "TATN", "GMKN", "PLZL", "ALRS", "MGNT"]
 SNAPSHOT_METRICS = ("price", "amplitude_atr", "amplitude_pct", "volume_ratio", "atr", "change_hour_pct",
                     "impulse_age_min", "plate_score", "level_distance_atr", "pullback_pct", "approach_intensity")
@@ -126,6 +131,8 @@ class Scanner:
                         logger.info("Сканер спит: %s, до %s", closed, fmt_ts(reopen))
                     self.cycle_info = {**self.db.get_state("last_cycle", {}), "status": "closed",
                                        "closed_reason": closed, "reopen_at": fmt_ts(reopen)}
+                elif await self.disk_guard():
+                    wait = interval
                 else:
                     try:
                         await self.run_cycle()
@@ -174,6 +181,7 @@ class Scanner:
             info["tickers"] = len(tickers)
             ctx = CycleContext(self.cycle_id, sets)
             ctx.warmup = bool(warmup)
+            ctx.liq_ref = self.liquidity_reference()
             jobs = [self._process_ticker(t, ctx) for t in tickers]
             await asyncio.gather(*jobs, return_exceptions=False)
             await self._sector_dump(ctx)
@@ -322,6 +330,13 @@ class Scanner:
     async def evaluate_ticker(self, ticker: str, ctx: "CycleContext") -> None:
         snaps = self.build_snapshots(ticker, ctx.sets)
         glob_s = ctx.sets[0][1]
+        liq = self.liquidity_score(ticker, ctx.liq_ref)
+        sec = self.securities.setdefault(ticker, {})
+        sec["liquidity_score"] = liq
+        for snap in snaps.values():  # фильтры issue #5: история и ликвидность
+            if snap is not None:
+                snap["hist_ranges"] = self.hist_ranges(ticker, snap.get("price"))
+                snap["liquidity_score"] = liq
         glob_snap = snaps.get(snapshot_group_key(glob_s))
         saved_windows: set[int] = set()
         for _, s in ctx.sets:  # сохраняем снапшот для каждого окна (глобальный — первым)
@@ -368,6 +383,8 @@ class Scanner:
             fev = al.evaluate(snap, s, intraday, detail["daily"], verdict)
             if kid is None:
                 final_glob = fev
+            if fev.alert is not None and fev.alert.direction == "down_plate":
+                self.plateau_check(fev.alert, snap, s)
             if fev.alert is not None:
                 ctx.candidates.append((kid, s, fev.alert))
                 await self.deliver(kid, s, fev.alert, ctx)
@@ -382,6 +399,154 @@ class Scanner:
                  json.dumps({**al.decision_details(ev), "snapshot": _slim(glob_snap)}, ensure_ascii=False, default=str)),
             )
         self._store_metrics(ticker, glob_snap, ev, detail, int(glob_s["candle_window_min"]))
+        try:
+            await self.pinbar_scan(ticker, glob_s, glob_snap, ctx)
+        except Exception:  # noqa: BLE001
+            logger.exception("Пин-бары %s", ticker)
+
+    # ------------------------------------------- фильтры по истории (issue #5)
+    def hist_ranges(self, ticker: str, price: Optional[float] = None) -> dict[str, list[float]]:
+        """{период: [max, min]} по дневным свечам (P2, ``daily_hist``) + сегодняшней
+        сессии. Период «1д» — только сегодня; без истории длинные периоды пропускаются."""
+        sec = self.securities.get(ticker) or {}
+        today = now_msk().strftime("%Y-%m-%d")
+        t_hi = [v for v in (sec.get("high"), sec.get("last"), price) if v]
+        t_lo = [v for v in (sec.get("low"), sec.get("last"), price) if v]
+        hist = [h for h in (sec.get("daily_hist") or []) if h[0] < today]
+        out: dict[str, list[float]] = {}
+        for key, days in HISTORY_DAYS.items():
+            past = hist[-(days - 1):] if days > 1 else []
+            if days > 1 and len(past) < min(days - 1, 2):
+                continue
+            highs = [h[1] for h in past if h[1]] + t_hi
+            lows = [h[2] for h in past if h[2]] + t_lo
+            if highs and lows and min(lows) > 0:
+                out[key] = [max(highs), min(lows)]
+        return out
+
+    def liquidity_reference(self) -> Optional[tuple[str, int]]:
+        """Эталон ликвидности (issue #5, задача 4): последние N минуток первой
+        доступной голубой фишки → (с какого времени, сколько свечей ожидается)."""
+        n = int(self.db.global_settings().get("liquidity_test_candles") or 1000)
+        for chip in BLUE_CHIPS:
+            row = self.db.query_one("SELECT MIN(ts) AS ts, COUNT(*) AS n FROM (SELECT ts FROM candles "
+                                    "WHERE ticker = ? ORDER BY ts DESC LIMIT ?)", (chip, n))
+            if row and row["n"] and row["n"] >= min(n, 60):
+                return row["ts"], int(row["n"])
+        return None
+
+    def liquidity_score(self, ticker: str, ref: Optional[tuple[str, int]]) -> Optional[float]:
+        """Доля минуток с ненулевым объёмом за эталонный интервал, 0..1."""
+        if not ref:
+            return None
+        n = self.db.query_one("SELECT COUNT(*) AS n FROM candles WHERE ticker = ? AND ts >= ? AND volume > 0",
+                              (ticker, ref[0]))["n"]
+        return round(min(n / ref[1], 1.0), 3)
+
+    # ------------------------------ пин-бары и уровни ликвидности (issue #5)
+    async def pinbar_scan(self, ticker: str, g: dict[str, Any], snap: dict[str, Any], ctx: "CycleContext") -> int:
+        """Задачи 5–6: пин-бары на закрытых свечах глобального окна → уровни
+        в ``pinbar_levels``; «отработан» — цена коснулась уровня за N свечей;
+        возврат цены к неотработанному уровню (после ухода от него) — пуш
+        каждому пользователю один раз."""
+        gs = self.db.global_settings()
+        w = int(g["candle_window_min"])
+        work_n = int(gs.get("pinbar_work_candles") or 10)
+        wc = an.aggregate(self.db.last_candles(ticker, min(40 * w, 2000)), w)
+        if len(wc) < 3:
+            return 0
+        found = an.detect_pinbar(wc, float(gs.get("pinbar_shadow_ratio") or 2.0),
+                                 float(gs.get("pinbar_max_body_ratio") or 0.3), float(gs.get("pinbar_volume_z") or 0))
+        now = fmt_ts(now_msk())
+        for p in found:
+            self.db.execute("INSERT OR IGNORE INTO pinbar_levels (ticker, ts, pattern_type, key_level, created_at) "
+                            "VALUES (?,?,?,?,?)", (ticker, p["ts"], p["type"], p["key_level"], now))
+        # Неотработанные уровни за срок хранения (старые — «магниты» на будущее)
+        levels = self.db.query("SELECT * FROM pinbar_levels WHERE ticker = ? AND worked_out = 0 ORDER BY ts DESC "
+                               "LIMIT 50", (ticker,))
+        price = snap.get("price")
+        sent = 0
+        g_pct = float(g.get("pinbar_approach_pct") or 1.0)
+        for lv in levels:
+            after = [c for c in wc if c["ts"] > lv["ts"]]
+            fresh = lv["ts"] >= wc[0]["ts"]  # есть все N свечей после пин-бара
+            hit = next((c for c in after[:work_n] if an.pinbar_touched(lv["pattern_type"], lv["key_level"], c)),
+                       None) if fresh else None
+            if hit is not None:  # уровень отработан: цена вернулась к хвосту за N свечей
+                self.db.execute("UPDATE pinbar_levels SET worked_out = 1, worked_at = ? WHERE id = ?",
+                                (hit["ts"], lv["id"]))
+                continue
+            if not price or (fresh and len(after) < 1):
+                continue
+            dist = abs(price - lv["key_level"]) / lv["key_level"] * 100
+            if not lv["departed"]:
+                if dist > g_pct:
+                    self.db.execute("UPDATE pinbar_levels SET departed = 1 WHERE id = ?", (lv["id"],))
+                continue
+            sent += await self._pinbar_approach(ticker, lv, price, dist, snap, ctx)
+        return sent
+
+    async def _pinbar_approach(self, ticker: str, lv: dict[str, Any], price: float, dist: float,
+                               snap: dict[str, Any], ctx: "CycleContext") -> int:
+        notified = json.loads(lv.get("notified") or "{}")
+        bull = lv["pattern_type"] == an.BULLISH_SWEEP
+        when = lv["ts"][11:16] if lv["ts"][:10] == snap["ts"][:10] else f"{lv['ts'][8:10]}.{lv['ts'][5:7]} {lv['ts'][11:16]}"
+        n = 0
+        for kid, s in ctx.sets:
+            k = str(kid) if kid is not None else "global"
+            if k in notified or not al.trigger_on(s, "pinbar_level") or dist > float(s.get("pinbar_approach_pct") or 1):
+                continue
+            reason = (f"Цена вернулась к уровню {'закупки' if bull else 'продажи'} (хвост свечи от {when}). "
+                      f"Вероятен отскок/продолжение; уровень {lv['key_level']:g}, цена {price:g} ({dist:.2f}%)")
+            alert = al.Alert(ticker=ticker, ts=snap["ts"], direction="pinbar_level", score=50, amplitude_atr=None,
+                             volume_ratio=None, level_break=0, reason=reason, action="pinbar_level", price=price,
+                             labels=[an.PINBAR_LABELS[lv["pattern_type"]], "уровень скрытой ликвидности"],
+                             extra={"pinbar": {"id": lv["id"], "ts": lv["ts"], "type": lv["pattern_type"],
+                                               "key_level": lv["key_level"], "distance_pct": round(dist, 3)},
+                                    "liquidity_score": snap.get("liquidity_score")})
+            notified[k] = fmt_ts(now_msk())
+            if await self.deliver(kid, s, alert, ctx) is not None:
+                n += 1
+        self.db.execute("UPDATE pinbar_levels SET notified = ? WHERE id = ?",
+                        (json.dumps(notified, ensure_ascii=False), lv["id"]))
+        return n
+
+    def pinbar_levels(self, ticker: str, since: Optional[str] = None) -> list[dict[str, Any]]:
+        rows = self.db.query("SELECT id, ts, pattern_type, key_level, worked_out, worked_at FROM pinbar_levels "
+                             "WHERE ticker = ? AND ts >= ? ORDER BY ts", (ticker, since or ""))
+        for r in rows:
+            r["label"] = an.PINBAR_LABELS.get(r["pattern_type"], r["pattern_type"])
+        return rows
+
+    def plateau_check(self, alert: al.Alert, snap: dict[str, Any], s: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Плита вниз после длительного плато → кандидат на покупку (issue #5).
+
+        Начало плиты = время алерта − n свечей окна; плато — окно
+        [начало − ``plateau_min_hours``, начало): минуток ≥ 50 % ожидаемых и
+        диапазон (max high − min low) / min low ≤ ``plateau_max_range_pct``."""
+        if not s.get("trig_plateau_dump", True) or alert.action != "rebound":
+            return None
+        hours = float(s.get("plateau_min_hours") or 0)
+        if hours <= 0:
+            return None
+        n = int((snap.get("plate") or {}).get("n") or s.get("plate_series_n") or 3)
+        start = parse_ts(alert.ts) - timedelta(minutes=n * int(s["candle_window_min"]))
+        frm = fmt_ts(start - timedelta(hours=hours))
+        rows = self.db.query("SELECT high, low FROM candles WHERE ticker = ? AND ts >= ? AND ts < ? AND low > 0",
+                             (alert.ticker, frm, fmt_ts(start)))
+        if len(rows) < hours * 60 * 0.5:
+            return None
+        hi, lo = max(r["high"] for r in rows), min(r["low"] for r in rows)
+        rng = (hi - lo) / lo * 100
+        if rng > float(s.get("plateau_max_range_pct") or 0):
+            return None
+        info = {"from": frm, "till": fmt_ts(start), "hours": hours, "range_pct": round(rng, 3), "candles": len(rows)}
+        alert.action = "plateau_buy"
+        alert.extra["plateau"] = info
+        alert.labels.append(f"после плато {hours:g} ч (диапазон {rng:.2f}%)")
+        alert.reason += f"; плита вниз после плато {hours:g} ч (диапазон {rng:.2f}%) — кандидат на покупку"
+        al.apply_filters(alert, snap, s)  # исторический потолок — теперь это покупка
+        return info
 
     def _store_metrics(self, ticker: str, snap: dict[str, Any], ev: Optional[al.Evaluation],
                        detail: Optional[dict[str, Any]], window: int) -> None:
@@ -471,6 +636,7 @@ class Scanner:
         if dup:
             return None
         warmup = ctx is not None and ctx.warmup
+        alert.extra.setdefault("cycle_id", ctx.cycle_id if ctx is not None else self.cycle_id)
         if key_id is not None and not warmup:
             self.track_entry(key_id, s, alert)
         suppressed = WARMUP_REASON if warmup else self.suppression_reason(key_id, s, alert)
@@ -526,7 +692,7 @@ class Scanner:
         if alert.direction not in (s.get("alert_types") or []):
             return "тип отключён"
         if alert.mute_push:
-            return "памп-фильтр"
+            return alert.extra.get("mute_reason") or "памп-фильтр"
         actions = s.get("push_actions")
         if actions is not None and alert.action not in actions:
             return "действие отключено"
@@ -534,6 +700,13 @@ class Scanner:
         pmin, pmax = float(s.get("push_price_min") or 0), float(s.get("push_price_max") or 0)
         if price is not None and ((pmin > 0 and price < pmin) or (pmax > 0 and price > pmax)):
             return "цена вне диапазона"
+        # Потенциал движения, порог пуша (issue #5, задача 2): изменение свечи или дня ≥ X %
+        thr = float(s.get("alert_threshold_percent") or 0)
+        if thr > 0 and alert.direction not in ("sector_dump", "pinbar_level"):
+            moves = [abs(float(v)) for v in (alert.extra.get("amplitude_pct"), alert.extra.get("day_change_pct"))
+                     if v is not None]
+            if moves and max(moves) < thr:
+                return f"изменение {max(moves):.2f}% < {thr:g}%"
         tracking = alert.action in TRACK_ENTER_ACTIONS
         cd = int(s.get("cooldown_min") or 0)
         if cd > 0 and not tracking:
@@ -553,7 +726,99 @@ class Scanner:
                 return f"лимит {limit} в день"
         if key_id is not None and in_quiet_hours(now, s.get("quiet_from"), s.get("quiet_to")):
             return "тихие часы"
+        if key_id is not None and self.away_since(key_id):
+            return AWAY_REASON
         return None
+
+    # ------------------------------------------------- режим «Отошёл» (issue #5)
+    def away_since(self, key_id: Optional[int]) -> Optional[str]:
+        return self.db.get_state(f"away:{key_id}") if key_id is not None else None
+
+    async def set_away(self, key_id: int, on: bool) -> dict[str, Any]:
+        """Включение — пуши замораживаются с текущего момента (сигналы пишутся в
+        историю с причиной «отошёл»). Выключение — досылаются только сигналы
+        последних двух сканирований: до ``AWAY_MAX_PUSHES`` отдельными пушами,
+        остальное — одним сводным."""
+        since = self.away_since(key_id)
+        if on:
+            if not since:
+                since = fmt_ts(now_msk())
+                self.db.set_state(f"away:{key_id}", since)
+            return {"away": True, "since": since, "redelivered": 0}
+        self.db.execute("DELETE FROM settings WHERE scope = 'state' AND key = ?", (f"away:{key_id}",))
+        if not since:
+            return {"away": False, "since": None, "redelivered": 0}
+        rows = self.db.query(
+            "SELECT * FROM alerts WHERE key_id = ? AND suppressed = ? "
+            "AND CAST(COALESCE(json_extract(extra, '$.cycle_id'), 0) AS INTEGER) >= ? ORDER BY ts, id",
+            (key_id, AWAY_REASON, self.cycle_id - 1))
+        s = self.db.effective_settings(key_id)
+        sent = 0
+        for r in rows[:AWAY_MAX_PUSHES]:
+            a = al.alert_from_row(r)
+            msg = al.format_push(a, s)
+            res = await self.push.send_to_key(key_id, msg["title"], msg["body"],
+                                              {"ticker": a["ticker"], "url": f"/#ticker/{a['ticker']}"})
+            sent += int(res["sent"] > 0)
+            self.db.execute("UPDATE alerts SET suppressed = NULL, pushed = ? WHERE id = ?",
+                            (1 if res["sent"] > 0 else 0, r["id"]))
+        rest = rows[AWAY_MAX_PUSHES:]
+        if rest:
+            tickers = sorted({r["ticker"] for r in rest})
+            await self.push.send_to_key(key_id, f"Пока вас не было: ещё {len(rest)} сигналов",
+                                        ", ".join(tickers[:20]) + (" …" if len(tickers) > 20 else ""),
+                                        {"url": "/#alerts"})
+            marks = ",".join("?" * len(rest))
+            self.db.execute(f"UPDATE alerts SET suppressed = NULL, pushed = 1 WHERE id IN ({marks})",
+                            tuple(r["id"] for r in rest))
+        return {"away": False, "since": None, "redelivered": len(rows), "pushed": sent,
+                "summary": len(rest)}
+
+    # --------------------------------------------- место на диске (issue #5)
+    def storage(self) -> dict[str, Any]:
+        """Размер базы и свободное место на диске, где лежит база."""
+        g = self.db.global_settings()
+        path = self.db.files()[0].parent if self.db.files() else "."
+        du = shutil.disk_usage(path)
+        min_gb = float(g.get("min_free_disk_gb") or 0)
+        return {"db_bytes": self.db.size_bytes(), "disk_total": du.total, "disk_free": du.free,
+                "disk_used": du.used, "min_free_gb": min_gb, "low": min_gb > 0 and du.free < min_gb * 1024 ** 3,
+                "paused": self.db.get_state("disk_paused"), "retention_days": int(g.get("retention_days") or 30),
+                "checked_at": fmt_ts(now_msk())}
+
+    async def disk_guard(self) -> bool:
+        """Перед каждым сканированием: мало места → пауза и один пуш всем.
+        Пауза снимается кнопкой «Проверить память» (``check_storage``)."""
+        if self.db.get_state("disk_paused"):
+            self.cycle_info = {**self.cycle_info, "status": "disk_paused"}
+            return True
+        try:
+            st = self.storage()
+        except OSError as exc:
+            logger.warning("Не удалось проверить диск: %s", exc)
+            return False
+        if not st["low"]:
+            return False
+        free_gb = st["disk_free"] / 1024 ** 3
+        self.db.set_state("disk_paused", {"at": fmt_ts(now_msk()), "free_gb": round(free_gb, 2),
+                                          "db_mb": round(st["db_bytes"] / 1024 ** 2, 1)})
+        logger.warning("Сканер на паузе: свободно %.2f ГБ < %s ГБ", free_gb, st["min_free_gb"])
+        for kid in active_user_ids(self.db):
+            await self.push.send_to_key(kid, "Сканер на паузе: мало места на диске",
+                                        f"Свободно {free_gb:.2f} ГБ (минимум {st['min_free_gb']:g} ГБ). "
+                                        "Админ: «Освободить память», затем «Проверить память».", {"url": "/#settings"})
+        self.cycle_info = {**self.cycle_info, "status": "disk_paused"}
+        return True
+
+    def check_storage(self) -> dict[str, Any]:
+        """Кнопка «Проверить память»: места достаточно — сканер продолжает."""
+        st = self.storage()
+        if not st["low"] and st["paused"]:
+            self.db.execute("DELETE FROM settings WHERE scope = 'state' AND key = 'disk_paused'")
+            st["paused"] = None
+            st["resumed"] = True
+            self.request_cycle()
+        return st
 
     # ----------------------------------------------------------- массовый снос
     async def _sector_dump(self, ctx: "CycleContext") -> None:
@@ -656,7 +921,7 @@ class Scanner:
     async def paper_notify(self, t: dict[str, Any], s: dict[str, Any], key: str, title: str, body: str) -> bool:
         """Один пуш на событие ``key`` по сделке. Не учитывается в дневном лимите,
         тихие часы соблюдаются. Отметка — в ``paper_trades.notified``."""
-        if not s.get("paper_notify_enabled", True):
+        if not s.get("paper_notify_enabled", True) or self.away_since(t["key_id"]):
             return False
         notified = json.loads(t.get("notified") or "{}")
         if key in notified:
@@ -721,6 +986,7 @@ class Scanner:
             self._daily_atr_day = today
             for t in tickers:
                 self.scheduler.submit(P2, f"daily ATR {t}", lambda t=t: self._daily_atr(t), dedup_key=f"datr:{t}")
+            self.scheduler.submit(P2, "IMOEX daily", self._imoex_daily, dedup_key="imoex_daily")
         if self._purge_day != today:
             self._purge_day = today
 
@@ -750,10 +1016,34 @@ class Scanner:
         frm = (today - timedelta(days=int(g["daily_history_days"]))).isoformat()
         daily = await self.iss.candles(ticker, 24, frm, (today - timedelta(days=1)).isoformat())
         ind = an.daily_indicators(daily) if daily else {}
+        sec = self.securities.setdefault(ticker, {})
         if ind.get("atr_pct") is not None:
-            sec = self.securities.setdefault(ticker, {})
             sec["daily_atr_pct"] = ind["atr_pct"]
+        # Компактная дневная история: фильтры по периоду и статистика рынка (issue #5)
+        today_s = today.isoformat()
+        sec["daily_hist"] = [[c["ts"][:10], c["high"], c["low"], c["close"]] for c in daily
+                             if c["ts"][:10] < today_s][-DAILY_HIST_KEEP:]
         return ind.get("atr_pct")
+
+    async def _imoex_daily(self) -> int:
+        """Дневные свечи IMOEX для корреляции (state ``imoex_daily``)."""
+        fetch = getattr(self.iss, "index_candles", None)
+        if fetch is None:
+            return 0
+        today = now_msk().date()
+        rows = await fetch((today - timedelta(days=100)).isoformat(), (today - timedelta(days=1)).isoformat())
+        data = [[r["ts"][:10], r["close"]] for r in rows if r.get("close")]
+        if data:
+            self.db.set_state("imoex_daily", data)
+        return len(data)
+
+    def market_stats(self) -> dict[str, Any]:
+        hist = {t: sec["daily_hist"] for t, sec in self.securities.items()
+                if sec.get("active") and sec.get("daily_hist")}
+        out = an.market_stats(hist, self.db.get_state("imoex_daily", []) or [])
+        for r in out["correlation"]:
+            r["name"] = (self.securities.get(r["ticker"]) or {}).get("name")
+        return out
 
     # ------------------------------------------------------- дневной отчёт (п. 8)
     async def _housekeeping_loop(self) -> None:
@@ -823,10 +1113,10 @@ class Scanner:
             "SELECT direction, COUNT(*) AS n FROM alerts WHERE key_id IS ? AND substr(ts,1,10) = ? GROUP BY direction",
             (key_id, day))
         report = {"day": day, "top": top, "counts": {r["direction"]: r["n"] for r in counts},
-                  "index": self.index, "created_at": fmt_ts(now_msk())}
+                  "index": self.index, "market_stats": self.market_stats(), "created_at": fmt_ts(now_msk())}
         self.db.execute("INSERT INTO daily_reports (key_id, day, created_at, data) VALUES (?,?,?,?)",
                         (key_id, day, report["created_at"], json.dumps(report, ensure_ascii=False, default=str)))
-        if send and key_id is not None and s.get("daily_report_enabled"):
+        if send and key_id is not None and s.get("daily_report_enabled") and not self.away_since(key_id):
             title, body = format_report(report)
             report["push"] = await self.push.send_to_key(key_id, title, body, {"url": "/#report"})
         return report
@@ -842,6 +1132,7 @@ class CycleContext:
         self.errors = 0
         self.no_data = 0
         self.warmup = False
+        self.liq_ref: Optional[tuple[str, int]] = None
         self.candidates: list[tuple[Optional[int], dict[str, Any], al.Alert]] = []
 
 
@@ -860,6 +1151,11 @@ def format_report(report: dict[str, Any]) -> tuple[str, str]:
     top = report["top"]
     title = f"Итоги дня {report['day']}"
     body = f"▲ Вверх: {line(top['up'])}\n▼ Вниз: {line(top['down'])}"
+    ms = report.get("market_stats") or {}
+    if ms.get("avg_intraday_pct") is not None:
+        body += f"\nРынок: день ±{ms['avg_intraday_pct']:.2f}%, неделя ±{ms['avg_weekly_pct']:.2f}%"
+    if ms.get("high"):
+        body += f"\nКорреляция с IMOEX высокая: {', '.join(ms['high'][:6])}"
     return title, body
 
 
