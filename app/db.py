@@ -102,6 +102,14 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 CREATE TABLE IF NOT EXISTS favorites (
     key_id INTEGER NOT NULL, ticker TEXT NOT NULL, PRIMARY KEY (key_id, ticker)
 );
+CREATE TABLE IF NOT EXISTS pinbar_levels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL, ts TEXT NOT NULL, pattern_type TEXT NOT NULL, key_level REAL NOT NULL,
+    created_at TEXT NOT NULL, worked_out INTEGER NOT NULL DEFAULT 0, worked_at TEXT,
+    departed INTEGER NOT NULL DEFAULT 0, notified TEXT,
+    UNIQUE (ticker, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_pinbar_ticker ON pinbar_levels (ticker, ts);
 """
 
 
@@ -126,6 +134,7 @@ class Database:
         ("paper_trades", "qty", "REAL"),
         ("paper_trades", "profit_rub", "REAL"),
         ("paper_trades", "notified", "TEXT"),
+        ("paper_trades", "levels_at", "TEXT"),  # issue #5: стоп/тейк правились — проверка с этого момента
     )
 
     def _migrate(self) -> None:
@@ -135,8 +144,12 @@ class Database:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         # issue #3, один раз: новые значения в уже сохранённых списках — колонка «Действия»
         # (кнопка Paper) и тип алерта «Памп» (иначе поиск пампов молча глушился бы «тип отключён»)
+        # issue #5: тип «уровень пин-бара», действия «плита после плато» и «уровень пин-бара»
         for marker, key, item in (("migr_actions_column", "dashboard_columns", "actions"),
-                                  ("migr_pump_alert_type", "alert_types", "pump")):
+                                  ("migr_pump_alert_type", "alert_types", "pump"),
+                                  ("migr_pinbar_alert_type", "alert_types", "pinbar_level"),
+                                  ("migr_plateau_push_action", "push_actions", "plateau_buy"),
+                                  ("migr_pinbar_push_action", "push_actions", "pinbar_level")):
             done = self._conn.execute("SELECT 1 FROM settings WHERE scope = 'state' AND key = ?", (marker,)).fetchone()
             if done:
                 continue
@@ -292,5 +305,24 @@ class Database:
             cur = self.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
             out[table] = cur.rowcount
         out["daily_reports"] = self.execute("DELETE FROM daily_reports WHERE day < ?", (cutoff[:10],)).rowcount
+        out["pinbar_levels"] = self.execute("DELETE FROM pinbar_levels WHERE ts < ?", (cutoff,)).rowcount
         self.execute("DELETE FROM sessions WHERE expires_at < ?", (fmt_ts(now_msk()),))
         return out
+
+    # ------------------------------------------------------------ disk (issue #5)
+    def files(self) -> list[Path]:
+        if self.path == ":memory:":
+            return []
+        return [p for p in (Path(self.path), Path(self.path + "-wal"), Path(self.path + "-shm")) if p.exists()]
+
+    def size_bytes(self) -> int:
+        """Размер базы на диске: основной файл + WAL + shm."""
+        return sum(p.stat().st_size for p in self.files())
+
+    def vacuum(self) -> None:
+        """Вернуть место на диск: перенос WAL в базу с усечением и VACUUM
+        (после DELETE SQLite лишь помечает страницы свободными)."""
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

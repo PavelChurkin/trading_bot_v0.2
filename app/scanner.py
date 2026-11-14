@@ -27,6 +27,7 @@ from datetime import timedelta
 from typing import Any, Optional
 
 from . import alerts as al
+from . import paper
 from . import analysis as an
 from .auth import active_user_ids
 from .db import Database
@@ -670,14 +671,22 @@ class Scanner:
         return bool(res.get("sent"))
 
     def check_paper_trade(self, t: dict[str, Any]) -> Optional[dict[str, Any]]:
-        candles = self.db.candles_since(t["ticker"], t["opened_at"])
-        long = t["side"] == "long"
-        for c in candles:
-            hit = None
-            if t["stop"] is not None and ((long and c["low"] <= t["stop"]) or (not long and c["high"] >= t["stop"])):
-                hit = ("stop", t["stop"])
-            elif t["take"] is not None and ((long and c["high"] >= t["take"]) or (not long and c["low"] <= t["take"])):
-                hit = ("take", t["take"])
+        """Стоп/тейк по минуткам с момента открытия (или последней правки уровней).
+
+        Issue #5: сделки с невалидными уровнями (стоп выше входа у лонга,
+        отрицательный тейк) не закрываются «по цене, которой не было»;
+        битые минутки пропускаются; при гэпе исполнение — по цене открытия."""
+        if not paper.levels_ok(t["side"], t["entry_price"], t.get("stop"), t.get("take")) and \
+                not self._levels_moved_ok(t):
+            logger.warning("Paper #%s %s: уровни не согласованы со стороной (%s, вход %s, стоп %s, тейк %s) — "
+                           "авто-закрытие пропущено", t["id"], t["ticker"], t["side"], t["entry_price"],
+                           t.get("stop"), t.get("take"))
+            return None
+        since = max(t["opened_at"], t.get("levels_at") or "")
+        for c in self.db.candles_since(t["ticker"], since):
+            if not paper.candle_ok(c):
+                continue
+            hit = paper.level_hit(t, c)
             if hit:
                 status, price = hit
                 pct, rub = self.paper_pnl(t, price)
@@ -686,6 +695,17 @@ class Scanner:
                     "WHERE id = ?", (status, price, c["ts"], pct, rub, t["id"]))
                 return {"status": status, "exit_price": price, "result_pct": pct, "profit_rub": rub}
         return None
+
+    @staticmethod
+    def _levels_moved_ok(t: dict[str, Any]) -> bool:
+        """Стоп, вручную подтянутый в безубыток/прибыль (выше входа у лонга),
+        валиден, если уровни заданы после открытия и стоп < тейк (лонг)."""
+        stop, take = t.get("stop"), t.get("take")
+        if not t.get("levels_at") or (stop is not None and stop <= 0) or (take is not None and take <= 0):
+            return False
+        if stop is None or take is None:
+            return True
+        return stop < take if t["side"] == "long" else stop > take
 
     # ------------------------------------------------------------- фон (P2)
     def _schedule_background(self, tickers: list[str]) -> None:
