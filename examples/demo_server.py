@@ -51,6 +51,7 @@ async def seed(db, scanner) -> None:
     scanner.apply_board(await iss.securities(), await iss.marketdata())
     for t in iss.minute:  # дневной ATR, как это делает P2-фон
         await scanner._daily_atr(t)
+    await scanner._imoex_daily()  # история IMOEX для корреляции (issue #5)
 
     # «Перемотка» двух последних дней: метрики для графиков и история сигналов
     sets = scanner.settings_sets()

@@ -232,3 +232,26 @@ ul.plain li, ol.plain li { font-size: 13px; }
   box-shadow: 0 0 0 1px var(--accent), 0 0 12px #3987e5aa; }
 .paper-btn.on:hover { box-shadow: 0 0 0 1px var(--accent), 0 0 18px #3987e5cc; }
 input.qty { width: 90px; text-align: right; padding: 4px 6px; }
+
+/* issue #5 */
+.copy-btn { background: none; border: 0; padding: 0 4px; margin-left: 2px; color: var(--muted); cursor: pointer;
+  font-size: 12px; line-height: 1; vertical-align: middle; min-height: 0; }
+.copy-btn:hover, .copy-btn:focus-visible { color: var(--accent); }
+.actions-cell { white-space: nowrap; }
+.actions-cell .tag { max-width: 220px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+input.lvl { width: 90px; text-align: right; padding: 4px 6px; }
+input.lvl.bad { border-color: var(--warn); }
+select.side { padding: 3px 6px; }
+.reset-btn { background: none; border: 1px solid var(--line-2); border-radius: 6px; color: var(--muted); cursor: pointer;
+  padding: 0 6px; font-size: 12px; align-self: flex-start; margin-top: 2px; min-height: 0; }
+.reset-btn:hover { color: var(--accent); border-color: var(--accent); }
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.switch input { width: 36px; height: 20px; appearance: none; -webkit-appearance: none; background: var(--line-2);
+  border-radius: 999px; position: relative; cursor: pointer; transition: background .2s; margin: 0; }
+.switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; transition: left .2s; }
+.switch input:checked { background: var(--warn); }
+.switch input:checked::after { left: 18px; }
+.closeness.wide-bar { width: 100%; height: 6px; margin: 4px 0 6px; }
+.closeness.wide-bar.full i { background: var(--down); }
+th[data-psort] { cursor: pointer; user-select: none; }
