@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -93,7 +94,14 @@ def create_app(ctx: AppContext) -> FastAPI:
     async def api_me(user: dict = Depends(current_user)):
         return {"user": user, "is_admin": user["role"] == "admin", "vapid_public_key": push.public_key,
                 "push_available": push.available, "push_error": push.error,
-                "devices": len(push.subscriptions(user["id"]))}
+                "devices": len(push.subscriptions(user["id"])), "away_since": scanner.away_since(user["id"]),
+                "disk_paused": db.get_state("disk_paused")}
+
+    @app.post("/api/away")
+    async def api_away(body: dict, user: dict = Depends(current_user)):
+        """Режим «Отошёл» (issue #5): пуши замораживаются; при возвращении
+        досылаются сигналы двух последних сканирований (≤ 10 + сводный)."""
+        return await scanner.set_away(user["id"], bool(body.get("on")))
 
     # ============================================================== статус
     @app.get("/api/status")
@@ -184,9 +192,24 @@ def create_app(ctx: AppContext) -> FastAPI:
 
     @app.post("/api/admin/purge")
     async def api_purge(user: dict = Depends(admin_user)):
-        """Очистка по сроку хранения прямо сейчас (обычно — раз в сутки в фоне)."""
+        """«Освободить память»: удалить данные старше срока хранения и сжать
+        базу (VACUUM), чтобы место вернулось на диск. Размер до/после."""
         days = int(db.global_settings()["retention_days"])
-        return {"ok": True, "days": days, "deleted": db.purge_older_than(days)}
+        before = db.size_bytes()
+        deleted = db.purge_older_than(days)
+        await asyncio.to_thread(db.vacuum)
+        return {"ok": True, "days": days, "deleted": deleted, "before_bytes": before, "after_bytes": db.size_bytes(),
+                "storage": scanner.storage()}
+
+    @app.get("/api/admin/storage")
+    async def api_storage(user: dict = Depends(admin_user)):
+        """Размер базы и свободное место на диске."""
+        return scanner.storage()
+
+    @app.post("/api/admin/storage/check")
+    async def api_storage_check(user: dict = Depends(admin_user)):
+        """«Проверить память»: места достаточно — сканер снимается с паузы."""
+        return scanner.check_storage()
 
     @app.post("/api/admin/stop")
     async def api_stop(user: dict = Depends(admin_user)):
@@ -259,7 +282,8 @@ def create_app(ctx: AppContext) -> FastAPI:
         sec = scanner.securities.get(ticker) or {}
         row = {"ticker": ticker, "name": sec.get("name"), "price": sec.get("last"), "sectype": sec.get("sectype"),
                "day_change_pct": sec.get("day_change_pct"), "volume_today": sec.get("volume_today"),
-               "value_today": sec.get("value_today"), "daily_atr_pct": sec.get("daily_atr_pct")}
+               "value_today": sec.get("value_today"), "daily_atr_pct": sec.get("daily_atr_pct"),
+               "liquidity_score": sec.get("liquidity_score")}
         if snap:
             ev = al.evaluate(snap, s)
             row.update({k: snap.get(k) for k in ("amplitude_pct", "amplitude_atr", "atr", "volume", "volume_ratio",
@@ -279,6 +303,7 @@ def create_app(ctx: AppContext) -> FastAPI:
         snaps = db.snapshots(int(s["candle_window_min"]))
         favs = {r["ticker"] for r in db.query("SELECT ticker FROM favorites WHERE key_id = ?", (user["id"],))}
         papers = _open_papers(user["id"])
+        last = _last_actions(user["id"])
         rows = []
         for t, sec in scanner.securities.items():
             if not sec.get("active"):
@@ -286,6 +311,11 @@ def create_app(ctx: AppContext) -> FastAPI:
             r = _row(t, snaps.get(t), s)
             r["favorite"] = t in favs
             r["paper"] = papers.get(t)
+            if t in last:
+                la = last[t]
+                r["last_action"] = la["action"]
+                r["last_action_label"] = al.ACTION_LABELS.get(la["action"], la["action"])
+                r["last_action_ts"] = la["ts"]
             rows.append(r)
         rows.sort(key=lambda r: (-(r.get("threshold_closeness") or 0), r["ticker"]))
         return {"columns": s["dashboard_columns"], "labels": ss.DASHBOARD_COLUMNS, "kinds": ss.SECURITY_KINDS,
@@ -314,7 +344,16 @@ def create_app(ctx: AppContext) -> FastAPI:
                 "alerts": [al.alert_from_row(r) for r in alerts_rows], "analysis": last_detail,
                 "favorite": bool(db.query_one("SELECT 1 FROM favorites WHERE key_id = ? AND ticker = ?",
                                               (user["id"], ticker))),
-                "paper": _open_papers(user["id"]).get(ticker)}
+                "paper": _open_papers(user["id"]).get(ticker),
+                "levels": scanner.pinbar_levels(ticker, fmt_ts(now_msk() - timedelta(days=max(1, min(days, 31)))))}
+
+    def _last_actions(key_id: int) -> dict[str, dict[str, Any]]:
+        """Рекомендованное действие из последнего алерта пользователя по тикеру
+        (колонка «Действия», issue #5)."""
+        rows = db.query("SELECT a.ticker, a.action, a.ts FROM alerts a JOIN (SELECT ticker, MAX(id) AS id FROM alerts "
+                        "WHERE key_id = ? AND ticker != 'РЫНОК' AND action IS NOT NULL GROUP BY ticker) m "
+                        "ON a.id = m.id", (key_id,))
+        return {r["ticker"]: r for r in rows}
 
     def _open_papers(key_id: int) -> dict[str, dict[str, Any]]:
         """Последняя открытая paper-позиция по каждому тикеру пользователя."""
@@ -439,7 +478,7 @@ def create_app(ctx: AppContext) -> FastAPI:
     async def api_alerts(scope: str = "mine", ticker: Optional[str] = None, direction: Optional[str] = None,
                          day: Optional[str] = None, limit: int = 200, fav: bool = False, kind: Optional[str] = None,
                          action: Optional[str] = None, sort: str = "time", triggered: bool = False,
-                         user: dict = Depends(current_user)):
+                         time: Optional[str] = None, user: dict = Depends(current_user)):
         """История сигналов (п. 9). ``scope=mine`` — алерты по моим порогам
         (с отметкой отправлен/подавлен), ``scope=all`` — общий журнал сканера.
 
@@ -465,6 +504,13 @@ def create_app(ctx: AppContext) -> FastAPI:
         if day:
             where.append("substr(a.ts,1,10) = ?")
             params.append(day)
+        if time:
+            # Фильтр по времени (issue #5): сигналы начиная с HH:MM выбранного дня (или сегодня)
+            if not re.fullmatch(r"\d{1,2}:\d{2}", time):
+                raise HTTPException(422, "Время в формате ЧЧ:ММ")
+            hh, mm = time.split(":")
+            where.append("a.ts >= ?")
+            params.append(f"{day or now_msk().strftime('%Y-%m-%d')} {int(hh):02d}:{mm}:00")
         if fav:
             where.append("a.ticker IN (SELECT ticker FROM favorites WHERE key_id = ?)")
             params.append(user["id"])
@@ -542,7 +588,8 @@ def create_app(ctx: AppContext) -> FastAPI:
         reports = db.query("SELECT day, MAX(created_at) AS created_at FROM daily_reports WHERE key_id = ? OR "
                            "key_id IS NULL GROUP BY day ORDER BY day DESC LIMIT 30", (user["id"],))
         return {"day": day, "live": live, "stored": json.loads(stored["data"]) if stored else None,
-                "days": reports, "report_time": db.effective_settings(user["id"])["daily_report_time"]}
+                "days": reports, "report_time": db.effective_settings(user["id"])["daily_report_time"],
+                "market_stats": scanner.market_stats()}
 
     @app.post("/api/report/send")
     async def api_report_send(user: dict = Depends(current_user)):
